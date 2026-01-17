@@ -1,0 +1,1 @@
+"""DataCite DOI record discovery."""
