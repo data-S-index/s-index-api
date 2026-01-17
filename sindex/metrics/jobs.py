@@ -30,8 +30,10 @@ def default_mdc_db_path():
     Returns HTTP URL if DUCKDB_MDC_URL is set, otherwise falls back to file path.
     Based on docker-compose.yml: http://localhost:8080 (or http://172.20.0.10:8080 from within docker network)
     """
+    print("[JOBS] Getting MDC DuckDB path")
     http_url = get_env("DUCKDB_MDC_URL")
     if http_url:
+        print(f"[JOBS] Using MDC DuckDB HTTP URL: {http_url}")
         return http_url
 
     # Fallback to file path for local development
@@ -39,6 +41,7 @@ def default_mdc_db_path():
     parent_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
     mdc_path = os.path.join(parent_dir, "input", "mdc")
     db_path = os.path.join(mdc_path, "mdc_index.duckdb")
+    print(f"[JOBS] Using MDC DuckDB file path: {db_path}")
     return db_path
 
 
@@ -48,8 +51,10 @@ def default_norm_db_path():
     Returns HTTP URL if DUCKDB_NORM_URL is set, otherwise falls back to file path.
     Based on docker-compose.yml: http://localhost:8081 (or http://172.20.0.11:8080 from within docker network)
     """
+    print("[JOBS] Getting normalization DuckDB path")
     http_url = get_env("DUCKDB_NORM_URL")
     if http_url:
+        print(f"[JOBS] Using normalization DuckDB HTTP URL: {http_url}")
         return http_url
 
     # Fallback to file path for local development
@@ -57,17 +62,31 @@ def default_norm_db_path():
     parent_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
     norm_path = os.path.join(parent_dir, "input", "mock_norm")
     db_path = os.path.join(norm_path, "mock_norm.duckdb")
+    print(f"[JOBS] Using normalization DuckDB file path: {db_path}")
     return db_path
 
 
 def dataset_index_series_from_doi(doi):
+    print(f"[JOBS] dataset_index_series_from_doi - Starting processing for DOI: {doi}")
     # Validate DOI and normalize
+    print(
+        f"[JOBS] dataset_index_series_from_doi - Validating and normalizing DOI: {doi}"
+    )
     norm_doi = _norm_doi(doi)
     if not norm_doi:
+        print(
+            f"[JOBS] dataset_index_series_from_doi - ERROR: Invalid DOI format: {doi}"
+        )
         raise ValueError(f"Invalid DOI format: {doi}")
 
     norm_doi_url = _norm_doi_url(norm_doi)
+    print(
+        f"[JOBS] dataset_index_series_from_doi - Checking if DOI resolves: {norm_doi_url}"
+    )
     if not is_working_doi(norm_doi_url, allow_blocked=True):
+        print(
+            f"[JOBS] dataset_index_series_from_doi - ERROR: DOI does not resolve: {norm_doi_url}"
+        )
         raise ValueError(f"'{norm_doi_url}' does not appear to resolve.")
 
     dataset_report = {}
@@ -76,24 +95,39 @@ def dataset_index_series_from_doi(doi):
     dataset_report["norm_doi_url"] = norm_doi_url
 
     # Get metadata from DataCite and create slim version
+    print(
+        f"[JOBS] dataset_index_series_from_doi - Fetching DataCite record for: {norm_doi}"
+    )
     rec = get_datacite_doi_record(norm_doi)
 
     if not rec:
         # Happens if DOI is valid but not found in DataCite (e.g. DOI of a manuscript)
+        print(
+            f"[JOBS] dataset_index_series_from_doi - DataCite record not found for: {norm_doi}"
+        )
         slim = None
         pubdate = None
         pubyear = None
         citations_block = None
     else:
+        print(
+            "[JOBS] dataset_index_series_from_doi - DataCite record found, creating slim version"
+        )
         slim = slim_datacite_record(rec)
         pubdate = slim.get("publication_date")
         pub_dt = _to_datetime_utc(pubdate)
         pubyear = pub_dt.year if pub_dt else None
         citations_block = slim.get("citations")
+        print(
+            f"[JOBS] dataset_index_series_from_doi - Publication date: {pubdate}, Year: {pubyear}"
+        )
 
     dataset_report["metadata"] = slim
 
     # Get domain (OpenAlex topic)
+    print(
+        f"[JOBS] dataset_index_series_from_doi - Fetching OpenAlex topic for: {norm_doi}"
+    )
     topic_result = get_primary_topic_for_doi(norm_doi)
 
     topic_id = None
@@ -102,8 +136,16 @@ def dataset_index_series_from_doi(doi):
     if topic_result and topic_result.get("topic_score", 0.0) > 0.5:
         dataset_report["topic"] = topic_result
         topic_id = topic_result.get("topic_id")
+        print(
+            f"[JOBS] dataset_index_series_from_doi - Topic found: {topic_id} (score: {topic_result.get('topic_score')})"
+        )
+    else:
+        print("[JOBS] dataset_index_series_from_doi - No valid topic found")
 
     # Get F-UJI FAIR score
+    print(
+        f"[JOBS] dataset_index_series_from_doi - Fetching F-UJI FAIR evaluation for: {norm_doi_url}"
+    )
     fair_report = fair_evaluation_report(norm_doi_url)
     dataset_report["fair"] = fair_report
 
@@ -111,44 +153,88 @@ def dataset_index_series_from_doi(doi):
     if fair_report and "fair_score" in fair_report:
         try:
             fair_score = float(fair_report["fair_score"])
+            print(f"[JOBS] dataset_index_series_from_doi - FAIR score: {fair_score}")
         except Exception:
             fair_score = None
+            print("[JOBS] dataset_index_series_from_doi - Could not parse FAIR score")
+    else:
+        print("[JOBS] dataset_index_series_from_doi - No FAIR score available")
 
     # Citations
+    print("[JOBS] dataset_index_series_from_doi - Searching for citations")
     citations_list = []
+    print("[JOBS] dataset_index_series_from_doi - Searching MDC citations")
     citations_mdc = find_citations_mdc_duckdb(
         doi, dataset_pub_date=pubdate, db_path=default_mdc_db_path()
     )
     if citations_mdc:
+        print(
+            f"[JOBS] dataset_index_series_from_doi - Found {len(citations_mdc)} MDC citations"
+        )
         citations_list.append(citations_mdc)
+    else:
+        print("[JOBS] dataset_index_series_from_doi - No MDC citations found")
 
+    print("[JOBS] dataset_index_series_from_doi - Searching OpenAlex citations")
     citations_oa = find_citations_oa(doi, dataset_pub_date=pubdate)
     if citations_oa:
+        print(
+            f"[JOBS] dataset_index_series_from_doi - Found {len(citations_oa)} OpenAlex citations"
+        )
         citations_list.append(citations_oa)
+    else:
+        print("[JOBS] dataset_index_series_from_doi - No OpenAlex citations found")
 
     if citations_block:
+        print(
+            "[JOBS] dataset_index_series_from_doi - Processing DataCite citation block"
+        )
         citations_dc = find_citations_dc_from_citation_block(
             doi, citations_block, dataset_pub_date=pubdate
         )
         if citations_dc:
+            print(
+                f"[JOBS] dataset_index_series_from_doi - Found {len(citations_dc)} DataCite citations"
+            )
             citations_list.append(citations_dc)
 
     citations = merge_citations_dicts(citations_list) if citations_list else None
+    if citations:
+        print(
+            f"[JOBS] dataset_index_series_from_doi - Total merged citations: {len(citations)}"
+        )
+    else:
+        print("[JOBS] dataset_index_series_from_doi - No citations found")
     dataset_report["citations"] = citations
 
     # Mentions
+    print("[JOBS] dataset_index_series_from_doi - Searching for mentions")
     mentions_list = []
+    print("[JOBS] dataset_index_series_from_doi - Searching GitHub mentions")
     mentions_github = find_github_mentions_for_dataset_id(doi, dataset_pub_date=pubdate)
     if mentions_github:
+        print(
+            f"[JOBS] dataset_index_series_from_doi - Found {len(mentions_github)} GitHub mentions"
+        )
         mentions_list.append(mentions_github)
+    else:
+        print("[JOBS] dataset_index_series_from_doi - No GitHub mentions found")
 
     mentions = merge_mentions_dicts(mentions_list)
     if mentions:
+        print(
+            f"[JOBS] dataset_index_series_from_doi - Total merged mentions: {len(mentions)}"
+        )
         dataset_report["mentions"] = mentions
     else:
+        print("[JOBS] dataset_index_series_from_doi - No mentions found")
         dataset_report["mentions"] = None
 
     # Normalization factors
+    print(
+        f"[JOBS] dataset_index_series_from_doi - Fetching normalization factors "
+        f"(topic_id: {topic_id}, year: {pubyear})"
+    )
     try:
         norm_db_path = default_norm_db_path()
         # DuckDB HTTP connections don't support context manager the same way
@@ -171,17 +257,25 @@ def dataset_index_series_from_doi(doi):
                     year=pubyear,
                     table="topic_norm_factors_mock",
                 )
+        print(f"[JOBS] dataset_index_series_from_doi - Normalization factors: {norm}")
     except KeyError:
         norm = None
+        print(
+            "[JOBS] dataset_index_series_from_doi - No normalization factors found (KeyError)"
+        )
 
     dataset_report["normalization_factors"] = norm
 
     # Dataset Index series
+    print("[JOBS] dataset_index_series_from_doi - Calculating dataset index series")
     Fi = (float(fair_score) / 100.0) if fair_score is not None else 0.0
 
     FT = norm["FT"] if norm else 0.5
     CTw = norm["CTw"] if norm else 1.0
     MTw = norm["MTw"] if norm else 1.0
+    print(
+        f"[JOBS] dataset_index_series_from_doi - Using factors: Fi={Fi}, FT={FT}, CTw={CTw}, MTw={MTw}"
+    )
 
     dataset_index_series = dataset_index_timeseries(
         Fi=Fi,
@@ -194,10 +288,18 @@ def dataset_index_series_from_doi(doi):
     )
 
     if dataset_index_series:
+        print(
+            f"[JOBS] dataset_index_series_from_doi - Generated dataset index series "
+            f"with {len(dataset_index_series)} data points"
+        )
         dataset_report["dataset_index_series"] = dataset_index_series
     else:
+        print(
+            "[JOBS] dataset_index_series_from_doi - No dataset index series generated"
+        )
         dataset_report["dataset_index_series"] = None
 
+    print(f"[JOBS] dataset_index_series_from_doi - Completed processing for DOI: {doi}")
     return dataset_report
 
 
@@ -227,23 +329,45 @@ def dataset_index_series_from_url(
     Returns:
         dataset_report dict with citations/mentions + normalization + dataset_index_series.
     """
+    print(f"[JOBS] dataset_index_series_from_url - Starting processing for URL: {url}")
+    print(
+        f"[JOBS] dataset_index_series_from_url - Parameters: identifier={identifier}, "
+        f"pubdate={pubdate}, topic_id={topic_id}"
+    )
     # Validate URL
     if not isinstance(url, str) or not url.strip():
+        print(
+            "[JOBS] dataset_index_series_from_url - ERROR: url must be a non-empty string"
+        )
         raise ValueError("url must be a non-empty string")
     url = url.strip()
 
     if not url.startswith(("http://", "https://")):
+        print(
+            f"[JOBS] dataset_index_series_from_url - ERROR: Invalid URL format: {url}"
+        )
         raise ValueError(
             f"Invalid URL format: {url} (must start with http:// or https://)"
         )
     if not is_url(url):
+        print(
+            f"[JOBS] dataset_index_series_from_url - ERROR: Invalid URL format: {url}"
+        )
         raise ValueError(f"Invalid URL format: {url}")
-
+    print(f"[JOBS] dataset_index_series_from_url - Checking if URL is reachable: {url}")
     if not _is_reachable(url):
+        print(
+            f"[JOBS] dataset_index_series_from_url - ERROR: URL is not reachable: {url}"
+        )
         raise ValueError(f"'{url}' does not appear to be reachable.")
 
+    print("[JOBS] dataset_index_series_from_url - Normalizing URL and identifier")
     norm_url = _norm_dataset_id(url)
     norm_identifier = _norm_dataset_id(identifier)
+    print(
+        f"[JOBS] dataset_index_series_from_url - Normalized URL: {norm_url}, "
+        f"Normalized identifier: {norm_identifier}"
+    )
 
     dataset_report = {}
     dataset_report["input_url"] = url
@@ -253,19 +377,35 @@ def dataset_index_series_from_url(
 
     # Non metadata, resolve pubdate
     if pubdate:
+        print(
+            f"[JOBS] dataset_index_series_from_url - Normalizing publication date: {pubdate}"
+        )
         try:
             pubdate = _norm_date_iso(pubdate)
+            print(
+                f"[JOBS] dataset_index_series_from_url - Normalized publication date: {pubdate}"
+            )
         except ValueError as e:
+            print(
+                f"[JOBS] dataset_index_series_from_url - ERROR: Invalid pubdate '{pubdate}': {e}"
+            )
             raise ValueError(f"Invalid pubdate '{pubdate}': {e}") from e
     pub_dt = _to_datetime_utc(pubdate)
     pubyear = pub_dt.year if pub_dt else None
+    print(
+        f"[JOBS] dataset_index_series_from_url - Publication date: {pubdate}, Year: {pubyear}"
+    )
 
     dataset_report["metadata"] = None
 
     # Domain (OpenALex topic)
     dataset_report["topic"] = topic_id
+    print(f"[JOBS] dataset_index_series_from_url - Using topic_id: {topic_id}")
 
     # Get F-UJI FAIR score
+    print(
+        f"[JOBS] dataset_index_series_from_url - Fetching F-UJI FAIR evaluation for: {url}"
+    )
     fair_report = fair_evaluation_report(url)
     dataset_report["fair"] = fair_report
 
@@ -273,35 +413,70 @@ def dataset_index_series_from_url(
     if fair_report and "fair_score" in fair_report:
         try:
             fair_score = float(fair_report["fair_score"])
+            print(f"[JOBS] dataset_index_series_from_url - FAIR score: {fair_score}")
         except Exception:
             fair_score = None
+            print("[JOBS] dataset_index_series_from_url - Could not parse FAIR score")
+    else:
+        print("[JOBS] dataset_index_series_from_url - No FAIR score available")
 
     # Citations (MDC only)
+    print("[JOBS] dataset_index_series_from_url - Searching for citations (MDC only)")
     citations_list: list[list[dict]] = []
 
+    print("[JOBS] dataset_index_series_from_url - Searching MDC citations")
     citations_mdc = find_citations_mdc_duckdb(
         url, dataset_pub_date=pubdate, db_path=default_mdc_db_path()
     )
     if citations_mdc:
+        print(
+            f"[JOBS] dataset_index_series_from_url - Found {len(citations_mdc)} MDC citations"
+        )
         citations_list.append(citations_mdc)
+    else:
+        print("[JOBS] dataset_index_series_from_url - No MDC citations found")
 
     citations = merge_citations_dicts(citations_list) if citations_list else None
+    if citations:
+        print(
+            f"[JOBS] dataset_index_series_from_url - Total merged citations: {len(citations)}"
+        )
+    else:
+        print("[JOBS] dataset_index_series_from_url - No citations found")
     dataset_report["citations"] = citations
 
     # Mentions
+    print("[JOBS] dataset_index_series_from_url - Searching for mentions")
     mentions_list: list[list[dict]] = []
 
+    print("[JOBS] dataset_index_series_from_url - Searching GitHub mentions")
     mentions_github = find_github_mentions_for_dataset_id(
         url,
         dataset_pub_date=pubdate,
     )
     if mentions_github:
+        print(
+            f"[JOBS] dataset_index_series_from_url - Found {len(mentions_github)} GitHub mentions"
+        )
         mentions_list.append(mentions_github)
+    else:
+        print("[JOBS] dataset_index_series_from_url - No GitHub mentions found")
 
     mentions = merge_mentions_dicts(mentions_list) if mentions_list else None
-    dataset_report["mentions"] = mentions
+    if mentions:
+        print(
+            f"[JOBS] dataset_index_series_from_url - Total merged mentions: {len(mentions)}"
+        )
+        dataset_report["mentions"] = mentions
+    else:
+        print("[JOBS] dataset_index_series_from_url - No mentions found")
+        dataset_report["mentions"] = mentions
 
     # 7) Normalization factors
+    print(
+        f"[JOBS] dataset_index_series_from_url - Fetching normalization factors "
+        f"(topic_id: {topic_id}, year: {pubyear})"
+    )
     try:
         norm_db_path = default_norm_db_path()
         # DuckDB HTTP connections don't support context manager the same way
@@ -324,17 +499,26 @@ def dataset_index_series_from_url(
                     year=pubyear,
                     table="topic_norm_factors_mock",
                 )
+        print(f"[JOBS] dataset_index_series_from_url - Normalization factors: {norm}")
     except KeyError:
         norm = None
+        print(
+            "[JOBS] dataset_index_series_from_url - No normalization factors found (KeyError)"
+        )
 
     dataset_report["normalization_factors"] = norm
 
     # Dataset Index series
+    print("[JOBS] dataset_index_series_from_url - Calculating dataset index series")
     Fi = (float(fair_score) / 100.0) if fair_score is not None else 0.0
 
     FT = norm["FT"] if norm else 0.5
     CTw = norm["CTw"] if norm else 1.0
     MTw = norm["MTw"] if norm else 1.0
+    print(
+        f"[JOBS] dataset_index_series_from_url - Using factors: "
+        f"Fi={Fi}, FT={FT}, CTw={CTw}, MTw={MTw}"
+    )
 
     dataset_index_series = dataset_index_timeseries(
         Fi=Fi,
@@ -346,5 +530,16 @@ def dataset_index_series_from_url(
         MTw=MTw,
     )
 
-    dataset_report["dataset_index_series"] = dataset_index_series or None
+    if dataset_index_series:
+        print(
+            f"[JOBS] dataset_index_series_from_url - Generated dataset index series "
+            f"with {len(dataset_index_series)} data points"
+        )
+        dataset_report["dataset_index_series"] = dataset_index_series
+    else:
+        print(
+            "[JOBS] dataset_index_series_from_url - No dataset index series generated"
+        )
+        dataset_report["dataset_index_series"] = None
+    print(f"[JOBS] dataset_index_series_from_url - Completed processing for URL: {url}")
     return dataset_report

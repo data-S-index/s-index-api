@@ -33,12 +33,22 @@ def get_datacite_doi_record(
         - The DOI is normalized with _norm_doi to lowercase and stripped of any "https://doi.org/" prefix.
         - DataCite api direct link: https://api.datacite.org/dois/{doi}
     """
+    print(f"[DATACITE] get_datacite_doi_record - Fetching record for DOI: {doi}")
     norm_doi = _norm_doi(doi)
     if not norm_doi:
+        print(f"[DATACITE] get_datacite_doi_record - ERROR: Invalid DOI: {doi}")
         raise ValueError(f"Invalid DOI: {doi}")
 
+    print(f"[DATACITE] get_datacite_doi_record - Normalized DOI: {norm_doi}")
     s = session or make_session(allowed_methods=("GET",))
-    return get_datacite_record_by_norm_doi(norm_doi, session=s)
+    result = get_datacite_record_by_norm_doi(norm_doi, session=s)
+    if result:
+        print(
+            f"[DATACITE] get_datacite_doi_record - Successfully retrieved record for: {norm_doi}"
+        )
+    else:
+        print(f"[DATACITE] get_datacite_doi_record - No record found for: {norm_doi}")
+    return result
 
 
 def stream_datacite_records(

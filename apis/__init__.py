@@ -17,8 +17,11 @@ class HelloEveryNyan(Resource):
     @api.response(400, "Validation Error")
     def get(self):
         """Returns a simple 'Server Active' message"""
-
-        return "Server active!"
+        print("[API] GET /echo - Request received")
+        print("[API] GET /echo - Status: Processing")
+        result = "Server active!"
+        print(f"[API] GET /echo - Status: Success - Response: {result}")
+        return result
 
 
 @api.route("/up", endpoint="up")
@@ -28,8 +31,11 @@ class Up(Resource):
     @api.response(200, "Success")
     def get(self):
         """Returns a simple message"""
-
-        return ":)"
+        print("[API] GET /up - Request received")
+        print("[API] GET /up - Status: Processing health check")
+        result = ":)"
+        print(f"[API] GET /up - Status: Success - Response: {result}")
+        return result
 
 
 @api.route("/dataset-index-series-from-doi", endpoint="dataset_index_series_from_doi")
@@ -50,11 +56,25 @@ class DatasetIndexSeriesFromDoi(Resource):
     @api.response(400, "Validation Error")
     def get(self):
         """Returns dataset report for the given DOI"""
+        print("[API] GET /dataset-index-series-from-doi - Request received")
         from sindex.metrics.jobs import dataset_index_series_from_doi
 
         args = self.parser.parse_args()
         doi = args["doi"]
-        return dataset_index_series_from_doi(doi)
+        print(
+            f"[API] GET /dataset-index-series-from-doi - Status: Processing - DOI: {doi}"
+        )
+        try:
+            result = dataset_index_series_from_doi(doi)
+            print(
+                f"[API] GET /dataset-index-series-from-doi - Status: Success - DOI: {doi}"
+            )
+            return result
+        except Exception as e:
+            print(
+                f"[API] GET /dataset-index-series-from-doi - Status: Error - DOI: {doi} - Error: {str(e)}"
+            )
+            raise
 
 
 @api.route("/dataset-index-series-from-url", endpoint="dataset_index_series_from_url")
@@ -96,6 +116,7 @@ class DatasetIndexSeriesFromUrl(Resource):
     @api.response(400, "Validation Error")
     def get(self):
         """Returns dataset report for the given URL"""
+        print("[API] GET /dataset-index-series-from-url - Request received")
         from sindex.metrics.jobs import dataset_index_series_from_url
 
         args = self.parser.parse_args()
@@ -103,6 +124,21 @@ class DatasetIndexSeriesFromUrl(Resource):
         identifier = args.get("identifier")
         pubdate = args.get("pubdate")
         topic_id = args.get("topic_id")
-        return dataset_index_series_from_url(
-            url, identifier=identifier, pubdate=pubdate, topic_id=topic_id
+        print(
+            f"[API] GET /dataset-index-series-from-url - Status: Processing - "
+            f"URL: {url}, identifier: {identifier}, pubdate: {pubdate}, "
+            f"topic_id: {topic_id}"
         )
+        try:
+            result = dataset_index_series_from_url(
+                url, identifier=identifier, pubdate=pubdate, topic_id=topic_id
+            )
+            print(
+                f"[API] GET /dataset-index-series-from-url - Status: Success - URL: {url}"
+            )
+            return result
+        except Exception as e:
+            print(
+                f"[API] GET /dataset-index-series-from-url - Status: Error - URL: {url} - Error: {str(e)}"
+            )
+            raise

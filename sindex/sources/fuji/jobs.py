@@ -22,6 +22,8 @@ def fair_evaluation_report(
       - discovery.fair_evaluate_doi_url() -> raw F-UJI JSON
       - normalize.fuji_report_from_response() -> compact FAIR report
     """
+    print(f"[FUJI] fair_evaluation_report - Evaluating FAIR score for: {doi_or_url}")
+    print(f"[FUJI] fair_evaluation_report - Using base URL: {base_url}")
     raw = fair_evaluate_doi_url(
         doi_or_url,
         base_url=base_url,
@@ -29,4 +31,12 @@ def fair_evaluation_report(
         password=password,
         session=session,
     )
-    return fuji_report_from_response(raw)
+    print(
+        f"[FUJI] fair_evaluation_report - Raw evaluation received, processing response"
+    )
+    result = fuji_report_from_response(raw)
+    if result and "fair_score" in result:
+        print(f"[FUJI] fair_evaluation_report - FAIR score: {result.get('fair_score')}")
+    else:
+        print(f"[FUJI] fair_evaluation_report - No FAIR score in result")
+    return result

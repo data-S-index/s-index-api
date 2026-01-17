@@ -27,6 +27,9 @@ def find_github_mentions_for_dataset_id(
     session: requests.Session | None = None,
     token: str | None = None,
 ) -> list[dict]:
+    print(
+        f"[GITHUB] find_github_mentions_for_dataset_id - Searching mentions for: {dataset_id}"
+    )
     """
     Search GitHub READMEs for mentions of a dataset identifier.
 
@@ -61,9 +64,17 @@ def find_github_mentions_for_dataset_id(
     else:
         search_term = dataset_id.lower()
     query = f'"{search_term}" in:file filename:README'
+    print(f"[GITHUB] find_github_mentions_for_dataset_id - Search query: {query}")
+    print(
+        f"[GITHUB] find_github_mentions_for_dataset_id - Max pages: {max_pages}, Include forks: {include_forks}"
+    )
     items = search_code(query, max_pages=max_pages, session=session, token=token)
     if not items:
+        print(f"[GITHUB] find_github_mentions_for_dataset_id - No search results found")
         return []
+    print(
+        f"[GITHUB] find_github_mentions_for_dataset_id - Found {len(items)} search results"
+    )
 
     repo_meta_cache: dict[str, dict[str, Any]] = {}
     repos_with_mentions: dict[str, dict[str, str]] = {}
@@ -121,4 +132,7 @@ def find_github_mentions_for_dataset_id(
             entry["mention_date"] = mention_dt
         results.append(entry)
 
+    print(
+        f"[GITHUB] find_github_mentions_for_dataset_id - Returning {len(results)} mentions"
+    )
     return results

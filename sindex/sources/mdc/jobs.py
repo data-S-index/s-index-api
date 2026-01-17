@@ -83,12 +83,19 @@ def find_citations_mdc_duckdb(
     dataset_pub_date: str | None = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> List[Dict[str, Any]]:
+    print(f"[MDC] find_citations_mdc_duckdb - Searching citations for: {target_id}")
+    print(f"[MDC] find_citations_mdc_duckdb - Using database: {db_path}")
     target_norm = _norm_dataset_id(target_id)
     if not target_norm:
+        print(
+            f"[MDC] find_citations_mdc_duckdb - Could not normalize target_id: {target_id}"
+        )
         return []
+    print(f"[MDC] find_citations_mdc_duckdb - Normalized target_id: {target_norm}")
 
     out: List[Dict[str, Any]] = []
 
+    print(f"[MDC] find_citations_mdc_duckdb - Querying database")
     with make_duckdb_conn(db_path, read_only=True) as con:
         rows = con.execute(
             """
@@ -98,6 +105,7 @@ def find_citations_mdc_duckdb(
             """,
             [target_norm],
         ).fetchall()
+    print(f"[MDC] find_citations_mdc_duckdb - Found {len(rows)} raw citation rows")
 
     for citation_link, citation_date_raw in rows:
         citation_date = None
@@ -117,4 +125,11 @@ def find_citations_mdc_duckdb(
 
         out.append(rec)
 
-    return dedupe_citations_by_link(out)
+    print(
+        f"[MDC] find_citations_mdc_duckdb - Processing {len(out)} citations before deduplication"
+    )
+    result = dedupe_citations_by_link(out)
+    print(
+        f"[MDC] find_citations_mdc_duckdb - Found {len(result)} citations after deduplication"
+    )
+    return result

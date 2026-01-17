@@ -357,8 +357,26 @@ def find_citations_dc_from_citation_block(
     """
     Wrapper
     """
-    return datacite_citations_block_to_records(
+    print(
+        f"[DATACITE] find_citations_dc_from_citation_block - Processing citations for: {target_doi}"
+    )
+    if citations:
+        print(
+            f"[DATACITE] find_citations_dc_from_citation_block - Citation block has {len(citations)} entries"
+        )
+    else:
+        print(
+            "[DATACITE] find_citations_dc_from_citation_block - No citation block provided"
+        )
+    result = datacite_citations_block_to_records(
         target_doi=target_doi,
         citations=citations,
         dataset_pub_date=dataset_pub_date,
     )
+    if result:
+        print(
+            f"[DATACITE] find_citations_dc_from_citation_block - Found {len(result)} citations"
+        )
+    else:
+        print("[DATACITE] find_citations_dc_from_citation_block - No citations found")
+    return result
