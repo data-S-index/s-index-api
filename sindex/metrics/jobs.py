@@ -25,7 +25,11 @@ from sindex.sources.openalex.jobs import find_citations_oa, get_primary_topic_fo
 
 
 def default_mdc_db_path():
-    """Get MDC DuckDB connection path/URL.)"""
+    """Get the default path to the MDC (Medical Data Commons) DuckDB database.
+
+    Returns:
+        str: Absolute path to the MDC DuckDB database file
+    """
     print("[JOBS] Getting MDC DuckDB path")
     current_dir = os.getcwd()
     mdc_path = os.path.join(current_dir, "input", "mdc")
@@ -35,7 +39,11 @@ def default_mdc_db_path():
 
 
 def default_norm_db_path():
-    """Get normalization DuckDB connection path/URL."""
+    """Get the default path to the normalization factors DuckDB database.
+
+    Returns:
+        str: Absolute path to the normalization DuckDB database file
+    """
     print("[JOBS] Getting normalization DuckDB path")
     current_dir = os.getcwd()
     norm_path = os.path.join(current_dir, "input", "mock_norm")
@@ -45,6 +53,35 @@ def default_norm_db_path():
 
 
 def dataset_index_series_from_doi(doi):
+    """Generate a complete dataset index series report from a DOI.
+
+    This function orchestrates the full pipeline for processing a dataset DOI:
+    - Validates and normalizes the DOI
+    - Fetches metadata from DataCite
+    - Retrieves OpenAlex topic classification
+    - Evaluates FAIR scores using F-UJI
+    - Collects citations from multiple sources (MDC, OpenAlex, DataCite)
+    - Collects mentions from GitHub
+    - Retrieves normalization factors
+    - Calculates dataset index time series
+
+    Args:
+        doi: DOI string (e.g., "10.13026/kpb9-mt58") or DOI URL
+
+    Returns:
+        dict: Complete dataset report containing:
+            - input_doi, norm_doi, norm_doi_url: Identifier information
+            - metadata: Slimmed DataCite record
+            - topic: OpenAlex topic classification
+            - fair: FAIR evaluation report
+            - citations: Merged citations from all sources
+            - mentions: Merged mentions from GitHub
+            - normalization_factors: Topic/year normalization factors
+            - dataset_index_series: Time series of dataset index values
+
+    Raises:
+        ValueError: If DOI format is invalid or DOI does not resolve
+    """
     print(f"[JOBS] dataset_index_series_from_doi - Starting processing for DOI: {doi}")
     # Validate DOI and normalize
     print(

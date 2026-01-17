@@ -1,3 +1,9 @@
+"""High-level discovery functions for F-UJI FAIR evaluation.
+
+This module provides functions to resolve identifiers and evaluate
+datasets using the F-UJI service.
+"""
+
 from __future__ import annotations
 
 import requests
@@ -14,15 +20,29 @@ def resolve_fuji_object_identifier(
     *,
     session: requests.Session,
 ) -> str:
-    """
-    Resolve input into the URL to send to F-UJI.
+    """Resolve input identifier into a URL suitable for F-UJI evaluation.
 
-    - If it's a working DOI (or DOI URL), return canonical DOI URL.
-    - Else if it's a working non-DOI URL, return it as-is.
-    - Else raise ValueError.
+    This function validates and normalizes the input identifier to ensure
+    it's a resolvable URL that F-UJI can evaluate. It handles both DOIs
+    and regular URLs.
+
+    Args:
+        doi_or_url: A DOI, DOI URL, or any resolvable URL
+        session: requests.Session for checking URL reachability
+
+    Returns:
+        str: Canonical URL to send to F-UJI
+            - For DOIs: returns canonical DOI URL (https://doi.org/...)
+            - For URLs: returns the URL as-is
+
+    Raises:
+        ValueError: If the identifier is neither a working DOI nor a working URL
     """
+    # Check if it's a working DOI and return canonical DOI URL
     if is_working_doi(doi_or_url, session=session):
         return _norm_doi_url(doi_or_url)  # canonical DOI URL
+
+    # Check if it's a working non-DOI URL
     if is_working_url(doi_or_url, session=session):
         return doi_or_url
 

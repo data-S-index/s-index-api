@@ -25,11 +25,28 @@ def find_citations_oa(
     session: Optional[requests.Session] = None,
     api_key: Optional[str] = None,
 ) -> List[Dict[str, object]]:
-    """
-    Wrapper:
-      - discovery: DOI (canonical or url) -> OA dataset record (raw)
-      - discovery: OA id -> citing works (raw)
-      - normalize: citing works -> citation objects
+    """Find all citations for a dataset DOI using OpenAlex.
+
+    This function orchestrates the full pipeline:
+    1. Resolves DOI to OpenAlex work record
+    2. Extracts OpenAlex ID from the record
+    3. Fetches all works that cite this dataset
+    4. Normalizes citing works into citation objects
+
+    Args:
+        doi: Dataset DOI (canonical or URL format)
+        dataset_pub_date: Optional publication date for citation weighting
+        email: Optional contact email for OpenAlex API (polite usage)
+        session: Optional shared requests.Session
+        api_key: Optional OpenAlex API key
+
+    Returns:
+        List of citation dictionaries, each containing:
+            - dataset_id: Original DOI
+            - source: ["openalex"]
+            - citation_link: URL to the citing work
+            - citation_date: Publication date of citing work
+            - citation_weight: Calculated weight based on time difference
     """
     print(f"[OPENALEX] find_citations_oa - Searching citations for DOI: {doi}")
     s = session or make_openalex_session(api_key=api_key)
@@ -49,7 +66,7 @@ def find_citations_oa(
     openalex_id = extract_openalex_id(record)
     if not openalex_id:
         print(
-            f"[OPENALEX] find_citations_oa - Could not extract OpenAlex ID from record"
+            "[OPENALEX] find_citations_oa - Could not extract OpenAlex ID from record"
         )
         return []
     print(f"[OPENALEX] find_citations_oa - OpenAlex ID: {openalex_id}")
@@ -68,12 +85,26 @@ def find_citations_oa(
 
 
 def get_primary_topic_for_doi(doi: str) -> dict | None:
-    """
-    Given a DOI, fetch the OpenAlex record using get_openalex_doi_record
-    and return the primary topic if it exists.
+    """Get the primary OpenAlex topic classification for a dataset DOI.
+
+    Fetches the OpenAlex work record for the given DOI and extracts
+    the primary topic classification along with its hierarchy (subfield,
+    field, domain).
+
+    Args:
+        doi: Dataset DOI (canonical or URL format)
 
     Returns:
-        Flat dict with topic + hierarchy info, or None.
+        dict: Topic information containing:
+            - doi: Original DOI
+            - work_id: OpenAlex work ID
+            - topic_id: OpenAlex topic ID
+            - topic_name: Display name of the topic
+            - topic_score: Confidence score for the topic assignment
+            - subfield_name: Subfield display name
+            - field_name: Field display name
+            - domain_name: Domain display name
+        Returns None if no OpenAlex record found or no primary topic exists
     """
     print(f"[OPENALEX] get_primary_topic_for_doi - Fetching topic for DOI: {doi}")
     work = get_openalex_doi_record(doi)
@@ -101,6 +132,7 @@ def get_primary_topic_for_doi(doi: str) -> dict | None:
         "domain_name": pt.get("domain", {}).get("display_name"),
     }
     print(
-        f"[OPENALEX] get_primary_topic_for_doi - Found topic: {result.get('topic_id')} (score: {result.get('topic_score')})"
+        f"[OPENALEX] get_primary_topic_for_doi - Found topic: {result.get('topic_id')} "
+        f"(score: {result.get('topic_score')})"
     )
     return result

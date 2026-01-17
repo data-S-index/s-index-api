@@ -95,7 +95,7 @@ def find_citations_mdc_duckdb(
 
     out: List[Dict[str, Any]] = []
 
-    print(f"[MDC] find_citations_mdc_duckdb - Querying database")
+    print("[MDC] find_citations_mdc_duckdb - Querying database")
     with make_duckdb_conn(db_path, read_only=True) as con:
         rows = con.execute(
             """

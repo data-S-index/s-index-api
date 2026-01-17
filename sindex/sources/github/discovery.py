@@ -27,11 +27,7 @@ def find_github_mentions_for_dataset_id(
     session: requests.Session | None = None,
     token: str | None = None,
 ) -> list[dict]:
-    print(
-        f"[GITHUB] find_github_mentions_for_dataset_id - Searching mentions for: {dataset_id}"
-    )
-    """
-    Search GitHub READMEs for mentions of a dataset identifier.
+    """Search GitHub READMEs for mentions of a dataset identifier.
 
     Uses `_norm_dataset_id()` to extract a normalized identifier for the search.
 
@@ -57,6 +53,9 @@ def find_github_mentions_for_dataset_id(
                 "mention_weight": <float>
             }
     """
+    print(
+        f"[GITHUB] find_github_mentions_for_dataset_id - Searching mentions for: {dataset_id}"
+    )
 
     doi_id = _norm_doi(dataset_id)
     if doi_id:
@@ -70,7 +69,7 @@ def find_github_mentions_for_dataset_id(
     )
     items = search_code(query, max_pages=max_pages, session=session, token=token)
     if not items:
-        print(f"[GITHUB] find_github_mentions_for_dataset_id - No search results found")
+        print("[GITHUB] find_github_mentions_for_dataset_id - No search results found")
         return []
     print(
         f"[GITHUB] find_github_mentions_for_dataset_id - Found {len(items)} search results"

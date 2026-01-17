@@ -1,3 +1,9 @@
+"""Low-level client for DataCite API.
+
+This module provides direct HTTP client functionality for interacting
+with the DataCite REST API to retrieve dataset metadata records.
+"""
+
 import requests
 
 from .constants import BASE_API_URL, DATACITE_TIMEOUT

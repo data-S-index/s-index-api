@@ -1,7 +1,17 @@
-"""Initialize the api system for the backend"""
+"""Initialize the API system for the backend.
+
+This module defines the Flask-RESTX API instance and all API endpoints
+for the S-Index backend service.
+"""
 
 from flask_restx import Api, Resource, reqparse
+from sindex.metrics.jobs import (
+    dataset_index_series_from_doi,
+    dataset_index_series_from_url,
+)
 
+# Initialize the Flask-RESTX API instance
+# This provides Swagger/OpenAPI documentation and request parsing
 api = Api(
     title="S-Index API",
     description="The backend API system for S-Index",
@@ -11,12 +21,19 @@ api = Api(
 
 @api.route("/echo", endpoint="echo")
 class HelloEveryNyan(Resource):
-    """Test if the server is active"""
+    """Test endpoint to verify the server is active and responding."""
 
     @api.response(200, "Success")
     @api.response(400, "Validation Error")
     def get(self):
-        """Returns a simple 'Server Active' message"""
+        """Returns a simple 'Server Active' message.
+
+        This is a health check endpoint that can be used to verify
+        the API server is running and accessible.
+
+        Returns:
+            str: A simple "Server active!" message
+        """
         print("[API] GET /echo - Request received")
         print("[API] GET /echo - Status: Processing")
         result = "Server active!"
@@ -26,11 +43,18 @@ class HelloEveryNyan(Resource):
 
 @api.route("/up", endpoint="up")
 class Up(Resource):
-    """Health check for kamal"""
+    """Health check endpoint for Kamal deployment monitoring."""
 
     @api.response(200, "Success")
     def get(self):
-        """Returns a simple message"""
+        """Returns a simple health check response.
+
+        This endpoint is used by Kamal (deployment tool) to verify
+        the service is running and healthy.
+
+        Returns:
+            str: A simple ":)" message indicating the service is up
+        """
         print("[API] GET /up - Request received")
         print("[API] GET /up - Status: Processing health check")
         result = ":)"
@@ -40,8 +64,13 @@ class Up(Resource):
 
 @api.route("/dataset-index-series-from-doi", endpoint="dataset_index_series_from_doi")
 class DatasetIndexSeriesFromDoi(Resource):
-    """Get dataset index series from a DOI"""
+    """Generate dataset index series from a DOI identifier.
 
+    This endpoint processes a DOI to generate a comprehensive dataset report
+    including citations, mentions, FAIR scores, and time-series index data.
+    """
+
+    # Request parser for validating and extracting query parameters
     parser = reqparse.RequestParser()
     parser.add_argument(
         "doi",
@@ -55,9 +84,26 @@ class DatasetIndexSeriesFromDoi(Resource):
     @api.response(200, "Success")
     @api.response(400, "Validation Error")
     def get(self):
-        """Returns dataset report for the given DOI"""
+        """Returns dataset report for the given DOI.
+
+        Processes the DOI through the full pipeline:
+        - Validates and normalizes the DOI
+        - Fetches metadata from DataCite
+        - Retrieves FAIR evaluation scores
+        - Collects citations from multiple sources (MDC, OpenAlex, DataCite)
+        - Collects mentions from GitHub
+        - Calculates normalization factors
+        - Generates dataset index time series
+
+        Returns:
+            dict: Complete dataset report with citations, mentions, FAIR scores,
+                  normalization factors, and dataset index series
+
+        Raises:
+            ValueError: If the DOI format is invalid or the DOI does not resolve
+            Exception: If any step in the processing pipeline fails
+        """
         print("[API] GET /dataset-index-series-from-doi - Request received")
-        from sindex.metrics.jobs import dataset_index_series_from_doi
 
         args = self.parser.parse_args()
         doi = args["doi"]
@@ -79,8 +125,14 @@ class DatasetIndexSeriesFromDoi(Resource):
 
 @api.route("/dataset-index-series-from-url", endpoint="dataset_index_series_from_url")
 class DatasetIndexSeriesFromUrl(Resource):
-    """Get dataset index series from a URL"""
+    """Generate dataset index series from a URL identifier.
 
+    This endpoint processes a URL (non-DOI) to generate a dataset report.
+    Unlike the DOI endpoint, this skips DOI-dependent sources like DataCite
+    and OpenAlex topic discovery.
+    """
+
+    # Request parser for validating and extracting query parameters
     parser = reqparse.RequestParser()
     parser.add_argument(
         "url",
@@ -115,9 +167,32 @@ class DatasetIndexSeriesFromUrl(Resource):
     @api.response(200, "Success")
     @api.response(400, "Validation Error")
     def get(self):
-        """Returns dataset report for the given URL"""
+        """Returns dataset report for the given URL.
+
+        Processes a URL through a simplified pipeline (skips DOI-dependent sources):
+        - Validates and normalizes the URL
+        - Retrieves FAIR evaluation scores
+        - Collects citations from MDC (DataCite and OpenAlex citations skipped)
+        - Collects mentions from GitHub
+        - Uses provided topic_id and pubdate if available
+        - Calculates normalization factors
+        - Generates dataset index time series
+
+        Args (via query parameters):
+            url: Required dataset landing page URL
+            identifier: Optional dataset identifier for MDC/GitHub searches
+            pubdate: Optional publication date (any reasonable format)
+            topic_id: Optional OpenAlex topic ID
+
+        Returns:
+            dict: Complete dataset report with citations, mentions, FAIR scores,
+                  normalization factors, and dataset index series
+
+        Raises:
+            ValueError: If the URL format is invalid or the URL is not reachable
+            Exception: If any step in the processing pipeline fails
+        """
         print("[API] GET /dataset-index-series-from-url - Request received")
-        from sindex.metrics.jobs import dataset_index_series_from_url
 
         args = self.parser.parse_args()
         url = args["url"]
