@@ -32,11 +32,11 @@ def fair_evaluation_report(
         session=session,
     )
     print(
-        f"[FUJI] fair_evaluation_report - Raw evaluation received, processing response"
+        "[FUJI] fair_evaluation_report - Raw evaluation received, processing response"
     )
     result = fuji_report_from_response(raw)
     if result and "fair_score" in result:
         print(f"[FUJI] fair_evaluation_report - FAIR score: {result.get('fair_score')}")
     else:
-        print(f"[FUJI] fair_evaluation_report - No FAIR score in result")
+        print("[FUJI] fair_evaluation_report - No FAIR score in result")
     return result

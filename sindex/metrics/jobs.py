@@ -124,8 +124,8 @@ def dataset_index_series_from_doi(doi):
     print(
         f"[JOBS] dataset_index_series_from_doi - Fetching F-UJI FAIR evaluation for: {norm_doi_url}"
     )
-    # fair_report = fair_evaluation_report(norm_doi_url)
-    fair_report = None
+    fair_report = fair_evaluation_report(norm_doi_url)
+    # fair_report = None
     dataset_report["fair"] = fair_report
 
     fair_score = None
