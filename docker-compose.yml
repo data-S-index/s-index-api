@@ -1,18 +1,14 @@
-version: "3"
-
 services:
   duckdb-mdc:
-    build:
-      context: .
-      dockerfile: Dockerfile.duckdb
+    image: duckdb/duckdb
     container_name: duckdb-mdc
-    networks:
-      duckdb_net:
-        ipv4_address: 172.20.0.10
     ports:
-      - "8080:8080"
+      - "31200:8080"
     volumes:
-      - ./input/mdc/mdc_index.duckdb:/data/mdc_index.duckdb:ro
+      - type: bind
+        source: ./input/mdc/mdc_index.duckdb
+        target: /data/mdc_index.duckdb
+        read_only: true
     environment:
       DUCKDB_PATH: /data/mdc_index.duckdb
       PORT: 8080
@@ -20,26 +16,17 @@ services:
     restart: unless-stopped
 
   duckdb-norm:
-    build:
-      context: .
-      dockerfile: Dockerfile.duckdb
+    image: duckdb/duckdb
     container_name: duckdb-norm
-    networks:
-      duckdb_net:
-        ipv4_address: 172.20.0.11
     ports:
-      - "8081:8080"
+      - "20891:8080"
     volumes:
-      - ./input/mock_norm/mock_norm.duckdb:/data/mock_norm.duckdb:ro
+      - type: bind
+        source: ./input/mock_norm/mock_norm.duckdb
+        target: /data/mock_norm.duckdb
+        read_only: true
     environment:
       DUCKDB_PATH: /data/mock_norm.duckdb
-      PORT: 8080
+      PORT: 8081
       HOST: 0.0.0.0
     restart: unless-stopped
-
-networks:
-  duckdb_net:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
