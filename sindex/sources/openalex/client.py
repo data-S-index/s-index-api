@@ -48,10 +48,29 @@ def get_openalex_record(
     session: requests.Session,
     params: dict | None = None,
     timeout: int = OA_TIMEOUT_SECS,
-) -> tuple[int, dict]:
+) -> dict | None:
     """
-    GET OA endpoint and return (status_code, json_dict).
-    Raises for invalid JSON, but does NOT call raise_for_status().
+    GET OpenAlex API endpoint and return the JSON response.
+
+    This function makes a GET request to the OpenAlex API and returns the
+    parsed JSON response. It handles 404 errors gracefully by returning None.
+
+    Args:
+        path: API endpoint path (e.g., "/works/W1234567890").
+        session: Shared requests.Session for connection reuse.
+        params: Optional query parameters to include in the request.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        Parsed JSON response as a dictionary, or None if the resource is not found (404).
+
+    Raises:
+        requests.HTTPError: If the API returns an HTTP error other than 404.
+        RuntimeError: If the response is not valid JSON.
+
+    Notes:
+        - Does NOT call raise_for_status() automatically, but will raise for
+          non-404 errors after attempting to parse JSON.
     """
     url = f"{OA_BASE_URL}{path}"
     r = session.get(url, params=params, timeout=timeout)
@@ -103,15 +122,15 @@ def fetch_openalex_topics_page(
     if sort:
         params["sort"] = sort
 
-    status, payload = get_openalex_record(
+    payload = get_openalex_record(
         "/topics",
         session=s,
         params=params,
         timeout=OA_TIMEOUT_SECS,
     )
 
-    if status >= 400:
-        raise requests.HTTPError(f"OpenAlex /topics request failed ({status})")
+    if payload is None:
+        raise requests.HTTPError("OpenAlex /topics request returned 404")
 
     return payload
 

@@ -1,0 +1,35 @@
+from __future__ import annotations
+
+import math
+
+from sindex.core.dates import _to_datetime_utc, _years_between
+
+
+def citation_weight(ds_dt: str | None, citation_dt: str | None) -> float:
+    a = 0.33
+
+    ds_dt_parsed = _to_datetime_utc(ds_dt)
+    citation_dt_parsed = _to_datetime_utc(citation_dt)
+
+    if ds_dt_parsed is None or citation_dt_parsed is None:
+        delta_years = 0.0
+    else:
+        delta_years = _years_between(ds_dt_parsed, citation_dt_parsed)
+
+    weight = 1.0 + a * math.log(1.0 + delta_years)
+    return round(weight, 2)
+
+
+def mention_weight(ds_dt: str | None, mention_dt: str | None) -> float:
+    a = 0.33
+
+    ds_dt_parsed = _to_datetime_utc(ds_dt)
+    mention_dt_parsed = _to_datetime_utc(mention_dt)
+
+    if ds_dt_parsed is None or mention_dt_parsed is None:
+        delta_years = 0.0
+    else:
+        delta_years = _years_between(ds_dt_parsed, mention_dt_parsed)
+
+    weight = 1.0 + a * math.log(1.0 + delta_years)
+    return round(weight, 2)

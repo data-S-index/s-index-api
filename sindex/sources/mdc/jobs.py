@@ -1,78 +1,120 @@
-"""MDC job functions."""
+from typing import Any, Dict, List
 
-# src/sindex/sources/github_mentions/jobs.py
+from sindex.core.dates import _norm_date_iso
+from sindex.core.ids import _norm_dataset_id
+from sindex.metrics.dedup import dedupe_citations_by_link
+from sindex.metrics.weights import citation_weight
 
-from __future__ import annotations
-
-import json
-import os
-import time
-
-import requests
-
-from sindex.core.io import _collect_ids_and_pub_dates_from_slimmed_file
-from sindex.sources.github.constants import DEFAULT_MAX_PAGES
-from sindex.sources.github.discovery import find_github_mentions_for_dataset_id
+from .client import make_duckdb_conn, register_mdc_udfs
+from .constants import DEFAULT_DB_PATH, DEFAULT_MDC_PATTERN
+from .discovery import list_mdc_files, mdc_glob
 
 
-def harvest_github_mentions_from_slim_ndjson_to_ndjson(
-    slim_folder: str,
-    output_path: str,
+def build_mdc_index(
+    mdc_folder: str,
     *,
-    max_pages: int = DEFAULT_MAX_PAGES,
-    include_forks: bool = False,
-    session: requests.Session | None = None,
-    token: str | None = None,
-) -> int:
+    pattern: str = DEFAULT_MDC_PATTERN,
+    db_path: str = DEFAULT_DB_PATH,
+) -> str:
+    files = list_mdc_files(mdc_folder, pattern)
+    if not files:
+        raise FileNotFoundError(
+            f"No MDC files found in {mdc_folder} matching {pattern}"
+        )
+
+    con = make_duckdb_conn(db_path, read_only=False)
+    register_mdc_udfs(con)
+
+    glob_path = mdc_glob(mdc_folder, pattern)
+
+    con.execute("DROP TABLE IF EXISTS mdc_index")
+
+    # 1) Ingest + normalize
+    con.execute(
+        f"""
+        CREATE TABLE mdc_index AS
+        SELECT
+            norm_dataset_id(dataset) AS dataset_norm,
+            norm_doi_url_or_raw(publication) AS citation_link,
+            norm_date_iso_safe(publishedDate) AS citation_date
+        FROM read_json_auto('{glob_path}')
+        WHERE dataset IS NOT NULL
+          AND publication IS NOT NULL;
     """
-    Read dataset IDs + pub dates from slimmed metadata, find GitHub mentions, write NDJSON.
-    """
-    _, dataset_info = _collect_ids_and_pub_dates_from_slimmed_file(
-        slim_folder, pattern="**/*.ndjson"
     )
-    if not dataset_info:
-        print(f"No dataset IDs found in slimmed metadata under: {slim_folder}")
-        return 0
 
-    dataset_ids = sorted(dataset_info.keys())
-    print(f"Found {len(dataset_ids)} unique dataset IDs in slimmed metadata.")
+    # 2) Clean failures
+    con.execute(
+        """
+        DELETE FROM mdc_index
+        WHERE dataset_norm IS NULL OR citation_link IS NULL OR citation_link = '';
+    """
+    )
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    # 3) Dedupe multiple entries of similar (dataset_norm, citation_link)
+    con.execute("DROP TABLE IF EXISTS mdc_index_dedup")
+    con.execute(
+        """
+        CREATE TABLE mdc_index_dedup AS
+        SELECT
+            dataset_norm,
+            citation_link,
+            any_value(citation_date) AS citation_date
+        FROM mdc_index
+        GROUP BY dataset_norm, citation_link;
+    """
+    )
+    con.execute("DROP TABLE mdc_index")
+    con.execute("ALTER TABLE mdc_index_dedup RENAME TO mdc_index")
 
-    total_written = 0
-    t0 = time.time()
-    s = session or requests.Session()
+    # 4) Index for fast point lookups
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mdc_dataset_norm ON mdc_index(dataset_norm)"
+    )
+    con.execute("ANALYZE mdc_index")
 
-    with open(output_path, "w", encoding="utf-8") as out_f:
-        total_ids = len(dataset_ids)
+    con.close()
+    return db_path
 
-        for idx, dataset_id in enumerate(dataset_ids, start=1):
-            info = dataset_info.get(dataset_id, {}) or {}
-            dataset_pub_date = info.get("pub_date", "") or ""
 
+def find_citations_mdc_duckdb(
+    target_id: str,
+    *,
+    dataset_pub_date: str | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
+    target_norm = _norm_dataset_id(target_id)
+    if not target_norm:
+        return []
+
+    out: List[Dict[str, Any]] = []
+
+    with make_duckdb_conn(db_path, read_only=True) as con:
+        rows = con.execute(
+            """
+            SELECT citation_link, citation_date
+            FROM mdc_index
+            WHERE dataset_norm = ?
+            """,
+            [target_norm],
+        ).fetchall()
+
+    for citation_link, citation_date_raw in rows:
+        citation_date = None
+        if citation_date_raw:
             try:
-                mentions = find_github_mentions_for_dataset_id(
-                    dataset_id,
-                    dataset_pub_date,
-                    max_pages=max_pages,
-                    include_forks=include_forks,
-                    session=s,
-                    token=token,
-                )
-            except Exception as e:
-                print(f"Error while processing ID {dataset_id}: {e}")
-                continue
+                citation_date = _norm_date_iso(str(citation_date_raw))
+            except ValueError:
+                citation_date = None
+        rec: Dict[str, Any] = {
+            "dataset_id": target_id,
+            "source": ["mdc"],
+            "citation_link": citation_link,
+            "citation_weight": citation_weight(dataset_pub_date, citation_date),
+        }
+        if citation_date:
+            rec["citation_date"] = citation_date
 
-            for rec in mentions:
-                out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                total_written += 1
+        out.append(rec)
 
-            if idx % 25 == 0 or idx == total_ids:
-                elapsed = time.time() - t0
-                print(
-                    f"[GitHub mentions] {idx}/{total_ids} IDs processed, "
-                    f"{total_written} mentions written (elapsed {elapsed:.1f}s)"
-                )
-
-    print(f"Done. Wrote {total_written} GitHub mention records to: {output_path}")
-    return total_written
+    return dedupe_citations_by_link(out)

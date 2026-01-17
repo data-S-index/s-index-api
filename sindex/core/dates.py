@@ -108,7 +108,7 @@ def _years_between(start_dt: datetime, end_dt: datetime) -> float:
 
     The result is constrained to be non-negative. If `end_dt` is earlier than
     `start_dt`, the return value is `0.0`. This prevents negative contribution
-    to weighting (e.g., citations that appear to pre-date the dataset publicatio for some reason).
+    to weighting (e.g., citations that appear to pre-date the dataset publication for some reason).
 
     Year length approximation: 365.25 days/year (to include leap-year average)
 
