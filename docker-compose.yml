@@ -1,11 +1,45 @@
 version: "3"
+
 services:
-  cwl-validator:
+  duckdb-mdc:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.duckdb
+    container_name: duckdb-mdc
+    networks:
+      duckdb_net:
+        ipv4_address: 172.20.0.10
     ports:
-      - 5000:5000
+      - "8080:8080"
+    volumes:
+      - ./input/mdc/mdc_index.duckdb:/data/mdc_index.duckdb:ro
     environment:
-      FLASK_DEBUG: 0
-      FLASK_APP: ./app.py
+      DUCKDB_PATH: /data/mdc_index.duckdb
+      PORT: 8080
+      HOST: 0.0.0.0
+    restart: unless-stopped
+
+  duckdb-norm:
+    build:
+      context: .
+      dockerfile: Dockerfile.duckdb
+    container_name: duckdb-norm
+    networks:
+      duckdb_net:
+        ipv4_address: 172.20.0.11
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./input/mock_norm/mock_norm.duckdb:/data/mock_norm.duckdb:ro
+    environment:
+      DUCKDB_PATH: /data/mock_norm.duckdb
+      PORT: 8080
+      HOST: 0.0.0.0
+    restart: unless-stopped
+
+networks:
+  duckdb_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
