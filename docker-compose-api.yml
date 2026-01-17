@@ -9,3 +9,9 @@ services:
     restart: unless-stopped
     stdin_open: true
     tty: true
+  fuji:
+    image: ghcr.io/pangaea-data-publisher/fuji:latest
+    container_name: fuji
+    ports:
+      - "16941:1071"
+    restart: unless-stopped
