@@ -22,14 +22,16 @@ def create_app(config_module=None, log_level="INFO"):
     middleware, extensions, and settings.
 
     Args:
-        config_module: Optional configuration module to use (defaults to "config")
+        config_module: Optional configuration module to use (defaults to "sindex.config")
         log_level: Logging level for the application (defaults to "INFO")
 
     Returns:
         Flask: Configured Flask application instance
     """
     print("[APP] Initializing Flask application")
-    print(f"[APP] Config module: {config_module or 'config'}, Log level: {log_level}")
+    print(
+        f"[APP] Config module: {config_module or 'sindex.config'}, Log level: {log_level}"
+    )
 
     # Create and configure the Flask app
     app = Flask(__name__)
@@ -48,9 +50,9 @@ def create_app(config_module=None, log_level="INFO"):
     print(f"[APP] Logging configured with level: {log_level}")
 
     # Load application configuration from the specified module
-    # If no module is specified, defaults to "config"
-    app.config.from_object(config_module or "config")
-    print(f"[APP] Configuration loaded from: {config_module or 'config'}")
+    # If no module is specified, defaults to "sindex.config"
+    app.config.from_object(config_module or "sindex.config")
+    print(f"[APP] Configuration loaded from: {config_module or 'sindex.config'}")
 
     # Initialize the API blueprint with the Flask app
     # This registers all API routes and endpoints

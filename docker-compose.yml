@@ -1,32 +1,18 @@
 services:
-  duckdb-mdc:
-    image: duckdb/duckdb
-    container_name: duckdb-mdc
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: s-index-api
     ports:
-      - "31200:8080"
-    volumes:
-      - type: bind
-        source: ./input/mdc/mdc_index.duckdb
-        target: /data/mdc_index.duckdb
-        read_only: true
-    environment:
-      DUCKDB_PATH: /data/mdc_index.duckdb
-      PORT: 8080
-      HOST: 0.0.0.0
+      - "6405:5000"
     restart: unless-stopped
+    stdin_open: true
+    tty: true
 
-  duckdb-norm:
-    image: duckdb/duckdb
-    container_name: duckdb-norm
+  fuji:
+    image: ghcr.io/pangaea-data-publisher/fuji:latest
+    container_name: fuji
     ports:
-      - "20891:8080"
-    volumes:
-      - type: bind
-        source: ./input/mock_norm/mock_norm.duckdb
-        target: /data/mock_norm.duckdb
-        read_only: true
-    environment:
-      DUCKDB_PATH: /data/mock_norm.duckdb
-      PORT: 8081
-      HOST: 0.0.0.0
+      - "21289:1071"
     restart: unless-stopped

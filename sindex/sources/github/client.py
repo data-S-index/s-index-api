@@ -1,9 +1,9 @@
-import os
 import time
 from typing import Any, Dict, List
 
 import requests
 
+from sindex.config.settings import get_github_token
 from sindex.sources.github.constants import (
     ACCEPT_HEADER,
     DEFAULT_MAX_PAGES,
@@ -14,13 +14,6 @@ from sindex.sources.github.constants import (
     SEARCH_CODE_URL,
     USER_AGENT,
 )
-
-
-def get_github_token():
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        raise EnvironmentError("GITHUB_TOKEN is not set in the environment.")
-    return token
 
 
 def build_headers(token: str | None = None) -> dict:

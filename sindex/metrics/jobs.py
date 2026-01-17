@@ -7,7 +7,7 @@ import os
 
 import duckdb
 
-from config import get_env
+
 from sindex.core.dates import _norm_date_iso, _to_datetime_utc
 from sindex.core.http import _is_reachable, is_url
 from sindex.core.ids import _norm_dataset_id, _norm_doi, _norm_doi_url, is_working_doi
@@ -25,42 +25,20 @@ from sindex.sources.openalex.jobs import find_citations_oa, get_primary_topic_fo
 
 
 def default_mdc_db_path():
-    """Get MDC DuckDB connection path/URL.
-
-    Returns HTTP URL if DUCKDB_MDC_URL is set, otherwise falls back to file path.
-    Based on docker-compose.yml: http://localhost:8080 (or http://172.20.0.10:8080 from within docker network)
-    """
+    """Get MDC DuckDB connection path/URL.)"""
     print("[JOBS] Getting MDC DuckDB path")
-    http_url = get_env("DUCKDB_MDC_URL")
-    if http_url:
-        print(f"[JOBS] Using MDC DuckDB HTTP URL: {http_url}")
-        return http_url
-
-    # Fallback to file path for local development
     current_dir = os.getcwd()
-    parent_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
-    mdc_path = os.path.join(parent_dir, "input", "mdc")
+    mdc_path = os.path.join(current_dir, "input", "mdc")
     db_path = os.path.join(mdc_path, "mdc_index.duckdb")
     print(f"[JOBS] Using MDC DuckDB file path: {db_path}")
     return db_path
 
 
 def default_norm_db_path():
-    """Get normalization DuckDB connection path/URL.
-
-    Returns HTTP URL if DUCKDB_NORM_URL is set, otherwise falls back to file path.
-    Based on docker-compose.yml: http://localhost:8081 (or http://172.20.0.11:8080 from within docker network)
-    """
+    """Get normalization DuckDB connection path/URL."""
     print("[JOBS] Getting normalization DuckDB path")
-    http_url = get_env("DUCKDB_NORM_URL")
-    if http_url:
-        print(f"[JOBS] Using normalization DuckDB HTTP URL: {http_url}")
-        return http_url
-
-    # Fallback to file path for local development
     current_dir = os.getcwd()
-    parent_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
-    norm_path = os.path.join(parent_dir, "input", "mock_norm")
+    norm_path = os.path.join(current_dir, "input", "mock_norm")
     db_path = os.path.join(norm_path, "mock_norm.duckdb")
     print(f"[JOBS] Using normalization DuckDB file path: {db_path}")
     return db_path
@@ -146,7 +124,8 @@ def dataset_index_series_from_doi(doi):
     print(
         f"[JOBS] dataset_index_series_from_doi - Fetching F-UJI FAIR evaluation for: {norm_doi_url}"
     )
-    fair_report = fair_evaluation_report(norm_doi_url)
+    # fair_report = fair_evaluation_report(norm_doi_url)
+    fair_report = None
     dataset_report["fair"] = fair_report
 
     fair_score = None
@@ -237,26 +216,13 @@ def dataset_index_series_from_doi(doi):
     )
     try:
         norm_db_path = default_norm_db_path()
-        # DuckDB HTTP connections don't support context manager the same way
-        if norm_db_path.startswith(("http://", "https://")):
-            con = duckdb.connect(norm_db_path)
-            try:
-                norm = get_topic_year_norm_factors(
-                    con,
-                    topic_id=topic_id,
-                    year=pubyear,
-                    table="topic_norm_factors_mock",
-                )
-            finally:
-                con.close()
-        else:
-            with duckdb.connect(norm_db_path) as con:
-                norm = get_topic_year_norm_factors(
-                    con,
-                    topic_id=topic_id,
-                    year=pubyear,
-                    table="topic_norm_factors_mock",
-                )
+        with duckdb.connect(norm_db_path) as con:
+            norm = get_topic_year_norm_factors(
+                con,
+                topic_id=topic_id,
+                year=pubyear,
+                table="topic_norm_factors_mock",
+            )
         print(f"[JOBS] dataset_index_series_from_doi - Normalization factors: {norm}")
     except KeyError:
         norm = None
@@ -479,26 +445,13 @@ def dataset_index_series_from_url(
     )
     try:
         norm_db_path = default_norm_db_path()
-        # DuckDB HTTP connections don't support context manager the same way
-        if norm_db_path.startswith(("http://", "https://")):
-            con = duckdb.connect(norm_db_path)
-            try:
-                norm = get_topic_year_norm_factors(
-                    con,
-                    topic_id=topic_id,
-                    year=pubyear,
-                    table="topic_norm_factors_mock",
-                )
-            finally:
-                con.close()
-        else:
-            with duckdb.connect(norm_db_path) as con:
-                norm = get_topic_year_norm_factors(
-                    con,
-                    topic_id=topic_id,
-                    year=pubyear,
-                    table="topic_norm_factors_mock",
-                )
+        with duckdb.connect(norm_db_path) as con:
+            norm = get_topic_year_norm_factors(
+                con,
+                topic_id=topic_id,
+                year=pubyear,
+                table="topic_norm_factors_mock",
+            )
         print(f"[JOBS] dataset_index_series_from_url - Normalization factors: {norm}")
     except KeyError:
         norm = None
