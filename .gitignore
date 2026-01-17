@@ -42,3 +42,5 @@ coverage
 postgres-data/*
 redis-data/*
 storage/*
+
+input/mdc/mdc_index.duckdb
