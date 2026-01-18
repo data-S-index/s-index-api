@@ -17,7 +17,7 @@ COPY input/mdc/mdc_index.duckdb ./input/mdc/mdc_index.duckdb
 # Copy application files
 COPY apis ./apis
 COPY sindex ./sindex
-COPY app.py entrypoint.sh .env ./
+COPY app.py entrypoint.sh ./
 
 # Convert line endings to Unix format and ensure the entrypoint script is executable
 RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh

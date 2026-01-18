@@ -9,6 +9,8 @@ services:
     restart: unless-stopped
     stdin_open: true
     tty: true
+    env_file:
+      - .env
   fuji:
     image: ghcr.io/pangaea-data-publisher/fuji:latest
     container_name: fuji
