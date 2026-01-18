@@ -2,6 +2,7 @@
 Flask
 flask-restx
 Flask-Cors
+Flask-Limiter
 
 # Server
 waitress

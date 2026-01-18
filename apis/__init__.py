@@ -4,6 +4,8 @@ This module defines the Flask-RESTX API instance and all API endpoints
 for the S-Index backend service.
 """
 
+from functools import wraps
+from flask import current_app
 from flask_restx import Api, Resource, reqparse
 from sindex.metrics.jobs import (
     dataset_index_series_from_doi,
@@ -17,6 +19,36 @@ api = Api(
     description="The backend API system for S-Index",
     doc="/docs",
 )
+
+
+def apply_rate_limit(limit_string):
+    """Decorator to apply rate limiting to a method.
+
+    This decorator accesses the limiter from Flask app extensions
+    and applies the rate limit decorator at runtime.
+
+    Args:
+        limit_string: Rate limit string (e.g., "500 per hour")
+
+    Returns:
+        Decorator function
+    """
+
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            limiter = current_app.extensions.get("limiter")
+            if limiter:
+                # Apply the rate limit decorator dynamically
+                # The limiter is already configured with a global key_func in app.py
+                # This will raise RateLimitExceeded if the limit is exceeded
+                limited_func = limiter.limit(limit_string)(f)
+                return limited_func(*args, **kwargs)
+            return f(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
 
 
 @api.route("/echo", endpoint="echo")
@@ -83,8 +115,12 @@ class DatasetIndexSeriesFromDoi(Resource):
     @api.expect(parser)
     @api.response(200, "Success")
     @api.response(400, "Validation Error")
+    @api.response(429, "Rate limit exceeded")
+    @apply_rate_limit("500 per hour")
     def get(self):
         """Returns dataset report for the given DOI.
+
+        Rate limited to 500 requests per hour globally.
 
         Processes the DOI through the full pipeline:
         - Validates and normalizes the DOI
@@ -166,8 +202,12 @@ class DatasetIndexSeriesFromUrl(Resource):
     @api.expect(parser)
     @api.response(200, "Success")
     @api.response(400, "Validation Error")
+    @api.response(429, "Rate limit exceeded")
+    @apply_rate_limit("500 per hour")
     def get(self):
         """Returns dataset report for the given URL.
+
+        Rate limited to 500 requests per hour globally.
 
         Processes a URL through a simplified pipeline (skips DOI-dependent sources):
         - Validates and normalizes the URL
