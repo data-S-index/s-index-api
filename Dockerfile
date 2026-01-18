@@ -1,11 +1,22 @@
-FROM python:3.13-alpine
+FROM python:3.12-alpine
 
 WORKDIR /app
 
 EXPOSE 5000
 
-# Install system dependencies including wget for downloading files
-RUN apk add --no-cache gcc libffi-dev musl-dev wget
+# Install system dependencies including build tools for compiling Python packages
+# DuckDB requires g++, cmake, make, ninja, and python3-dev to build from source on Alpine
+RUN apk add --no-cache \
+    gcc \
+    g++ \
+    make \
+    cmake \
+    ninja \
+    python3-dev \
+    libffi-dev \
+    musl-dev \
+    openssl-dev \
+    wget
 
 # Upgrade pip to latest version for better package compatibility
 RUN pip install --no-cache-dir --upgrade pip
