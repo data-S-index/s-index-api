@@ -9,6 +9,7 @@ import logging
 # Flask imports for web framework functionality
 from flask import Flask
 from flask_cors import CORS  # For handling Cross-Origin Resource Sharing
+from flask_limiter import Limiter
 from waitress import serve  # Production WSGI server
 
 # Import the API blueprint from the apis module
@@ -36,6 +37,21 @@ def create_app(config_module=None, log_level="INFO"):
     # Create and configure the Flask app
     app = Flask(__name__)
     print("[APP] Flask app created")
+
+    # Configure rate limiting (will be applied to specific endpoints)
+    # Using a constant key function to apply the limit globally across all requests
+    # Using sliding-window-counter strategy for smoother rate limiting (prevents bursts at window boundaries)
+    limiter = Limiter(
+        app=app,
+        key_func=lambda: "global",  # All requests share the same rate limit
+        storage_uri="memory://",  # In-memory storage (suitable for single instance)
+        strategy="sliding-window-counter",  # Sliding window for smoother rate limiting
+    )
+    # Store limiter on app for access in API module
+    app.extensions["limiter"] = limiter
+    print(
+        "[APP] Rate limiting configured (will be applied to dataset-index-series endpoints)"
+    )
 
     # Configure Swagger UI settings for API documentation
     # "none" means no endpoints are expanded by default

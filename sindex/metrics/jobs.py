@@ -4,6 +4,7 @@ This module contains job functions for generating dataset index series.
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import duckdb
 
@@ -139,80 +140,128 @@ def dataset_index_series_from_doi(doi):
 
     dataset_report["metadata"] = slim
 
-    # Get domain (OpenAlex topic)
+    # Parallelize: OpenAlex topic, F-UJI FAIR evaluation
     print(
-        f"[JOBS] dataset_index_series_from_doi - Fetching OpenAlex topic for: {norm_doi}"
+        "[JOBS] dataset_index_series_from_doi - Starting parallel fetch for topic and FAIR evaluation"
     )
-    topic_result = get_primary_topic_for_doi(norm_doi)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        topic_future = executor.submit(get_primary_topic_for_doi, norm_doi)
+        fair_future = executor.submit(fair_evaluation_report, norm_doi_url)
 
-    topic_id = None
-    dataset_report["topic"] = None
-
-    if topic_result and topic_result.get("topic_score", 0.0) > 0.5:
-        dataset_report["topic"] = topic_result
-        topic_id = topic_result.get("topic_id")
+        # Get domain (OpenAlex topic)
         print(
-            f"[JOBS] dataset_index_series_from_doi - Topic found: {topic_id} (score: {topic_result.get('topic_score')})"
+            f"[JOBS] dataset_index_series_from_doi - Fetching OpenAlex topic for: {norm_doi}"
         )
-    else:
-        print("[JOBS] dataset_index_series_from_doi - No valid topic found")
+        topic_result = topic_future.result()
 
-    # Get F-UJI FAIR score
-    print(
-        f"[JOBS] dataset_index_series_from_doi - Fetching F-UJI FAIR evaluation for: {norm_doi_url}"
-    )
-    fair_report = fair_evaluation_report(norm_doi_url)
-    # fair_report = None
-    dataset_report["fair"] = fair_report
+        topic_id = None
+        dataset_report["topic"] = None
 
-    fair_score = None
-    if fair_report and "fair_score" in fair_report:
-        try:
-            fair_score = float(fair_report["fair_score"])
-            print(f"[JOBS] dataset_index_series_from_doi - FAIR score: {fair_score}")
-        except Exception:
-            fair_score = None
-            print("[JOBS] dataset_index_series_from_doi - Could not parse FAIR score")
-    else:
-        print("[JOBS] dataset_index_series_from_doi - No FAIR score available")
-
-    # Citations
-    print("[JOBS] dataset_index_series_from_doi - Searching for citations")
-    citations_list = []
-    print("[JOBS] dataset_index_series_from_doi - Searching MDC citations")
-    citations_mdc = find_citations_mdc_duckdb(
-        doi, dataset_pub_date=pubdate, db_path=default_mdc_db_path()
-    )
-    if citations_mdc:
-        print(
-            f"[JOBS] dataset_index_series_from_doi - Found {len(citations_mdc)} MDC citations"
-        )
-        citations_list.append(citations_mdc)
-    else:
-        print("[JOBS] dataset_index_series_from_doi - No MDC citations found")
-
-    print("[JOBS] dataset_index_series_from_doi - Searching OpenAlex citations")
-    citations_oa = find_citations_oa(doi, dataset_pub_date=pubdate)
-    if citations_oa:
-        print(
-            f"[JOBS] dataset_index_series_from_doi - Found {len(citations_oa)} OpenAlex citations"
-        )
-        citations_list.append(citations_oa)
-    else:
-        print("[JOBS] dataset_index_series_from_doi - No OpenAlex citations found")
-
-    if citations_block:
-        print(
-            "[JOBS] dataset_index_series_from_doi - Processing DataCite citation block"
-        )
-        citations_dc = find_citations_dc_from_citation_block(
-            doi, citations_block, dataset_pub_date=pubdate
-        )
-        if citations_dc:
+        if topic_result and topic_result.get("topic_score", 0.0) > 0.5:
+            dataset_report["topic"] = topic_result
+            topic_id = topic_result.get("topic_id")
             print(
-                f"[JOBS] dataset_index_series_from_doi - Found {len(citations_dc)} DataCite citations"
+                f"[JOBS] dataset_index_series_from_doi - Topic found: {topic_id} "
+                f"(score: {topic_result.get('topic_score')})"
             )
-            citations_list.append(citations_dc)
+        else:
+            print("[JOBS] dataset_index_series_from_doi - No valid topic found")
+
+        # Get F-UJI FAIR score
+        print(
+            f"[JOBS] dataset_index_series_from_doi - Fetching F-UJI FAIR evaluation for: {norm_doi_url}"
+        )
+        fair_report = fair_future.result()
+        dataset_report["fair"] = fair_report
+
+        fair_score = None
+        if fair_report and "fair_score" in fair_report:
+            try:
+                fair_score = float(fair_report["fair_score"])
+                print(
+                    f"[JOBS] dataset_index_series_from_doi - FAIR score: {fair_score}"
+                )
+            except Exception:
+                fair_score = None
+                print(
+                    "[JOBS] dataset_index_series_from_doi - Could not parse FAIR score"
+                )
+        else:
+            print("[JOBS] dataset_index_series_from_doi - No FAIR score available")
+
+    # Parallelize: Citations and mentions
+    print(
+        "[JOBS] dataset_index_series_from_doi - Starting parallel search for citations and mentions"
+    )
+    citations_list = []
+    mentions_list = []
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {}
+
+        # Submit all citation and mention searches
+        futures["mdc"] = executor.submit(
+            find_citations_mdc_duckdb,
+            doi,
+            dataset_pub_date=pubdate,
+            db_path=default_mdc_db_path(),
+        )
+        futures["oa"] = executor.submit(
+            find_citations_oa, doi, dataset_pub_date=pubdate
+        )
+        futures["github"] = executor.submit(
+            find_github_mentions_for_dataset_id, doi, dataset_pub_date=pubdate
+        )
+
+        if citations_block:
+            futures["dc"] = executor.submit(
+                find_citations_dc_from_citation_block,
+                doi,
+                citations_block,
+                dataset_pub_date=pubdate,
+            )
+
+        # Collect results
+        print("[JOBS] dataset_index_series_from_doi - Searching MDC citations")
+        citations_mdc = futures["mdc"].result()
+        if citations_mdc:
+            print(
+                f"[JOBS] dataset_index_series_from_doi - Found {len(citations_mdc)} MDC citations"
+            )
+            citations_list.append(citations_mdc)
+        else:
+            print("[JOBS] dataset_index_series_from_doi - No MDC citations found")
+
+        print("[JOBS] dataset_index_series_from_doi - Searching OpenAlex citations")
+        citations_oa = futures["oa"].result()
+        if citations_oa:
+            print(
+                f"[JOBS] dataset_index_series_from_doi - Found {len(citations_oa)} OpenAlex citations"
+            )
+            citations_list.append(citations_oa)
+        else:
+            print("[JOBS] dataset_index_series_from_doi - No OpenAlex citations found")
+
+        if citations_block:
+            print(
+                "[JOBS] dataset_index_series_from_doi - Processing DataCite citation block"
+            )
+            citations_dc = futures["dc"].result()
+            if citations_dc:
+                print(
+                    f"[JOBS] dataset_index_series_from_doi - Found {len(citations_dc)} DataCite citations"
+                )
+                citations_list.append(citations_dc)
+
+        print("[JOBS] dataset_index_series_from_doi - Searching GitHub mentions")
+        mentions_github = futures["github"].result()
+        if mentions_github:
+            print(
+                f"[JOBS] dataset_index_series_from_doi - Found {len(mentions_github)} GitHub mentions"
+            )
+            mentions_list.append(mentions_github)
+        else:
+            print("[JOBS] dataset_index_series_from_doi - No GitHub mentions found")
 
     citations = merge_citations_dicts(citations_list) if citations_list else None
     if citations:
@@ -223,20 +272,7 @@ def dataset_index_series_from_doi(doi):
         print("[JOBS] dataset_index_series_from_doi - No citations found")
     dataset_report["citations"] = citations
 
-    # Mentions
-    print("[JOBS] dataset_index_series_from_doi - Searching for mentions")
-    mentions_list = []
-    print("[JOBS] dataset_index_series_from_doi - Searching GitHub mentions")
-    mentions_github = find_github_mentions_for_dataset_id(doi, dataset_pub_date=pubdate)
-    if mentions_github:
-        print(
-            f"[JOBS] dataset_index_series_from_doi - Found {len(mentions_github)} GitHub mentions"
-        )
-        mentions_list.append(mentions_github)
-    else:
-        print("[JOBS] dataset_index_series_from_doi - No GitHub mentions found")
-
-    mentions = merge_mentions_dicts(mentions_list)
+    mentions = merge_mentions_dicts(mentions_list) if mentions_list else None
     if mentions:
         print(
             f"[JOBS] dataset_index_series_from_doi - Total merged mentions: {len(mentions)}"
@@ -405,39 +441,77 @@ def dataset_index_series_from_url(
     dataset_report["topic"] = topic_id
     print(f"[JOBS] dataset_index_series_from_url - Using topic_id: {topic_id}")
 
-    # Get F-UJI FAIR score
+    # Parallelize: F-UJI FAIR evaluation, MDC citations, GitHub mentions
     print(
-        f"[JOBS] dataset_index_series_from_url - Fetching F-UJI FAIR evaluation for: {url}"
+        "[JOBS] dataset_index_series_from_url - Starting parallel fetch for FAIR evaluation, citations, and mentions"
     )
-    fair_report = fair_evaluation_report(url)
-    dataset_report["fair"] = fair_report
-
-    fair_score = None
-    if fair_report and "fair_score" in fair_report:
-        try:
-            fair_score = float(fair_report["fair_score"])
-            print(f"[JOBS] dataset_index_series_from_url - FAIR score: {fair_score}")
-        except Exception:
-            fair_score = None
-            print("[JOBS] dataset_index_series_from_url - Could not parse FAIR score")
-    else:
-        print("[JOBS] dataset_index_series_from_url - No FAIR score available")
-
-    # Citations (MDC only)
-    print("[JOBS] dataset_index_series_from_url - Searching for citations (MDC only)")
     citations_list: list[list[dict]] = []
+    mentions_list: list[list[dict]] = []
 
-    print("[JOBS] dataset_index_series_from_url - Searching MDC citations")
-    citations_mdc = find_citations_mdc_duckdb(
-        url, dataset_pub_date=pubdate, db_path=default_mdc_db_path()
-    )
-    if citations_mdc:
-        print(
-            f"[JOBS] dataset_index_series_from_url - Found {len(citations_mdc)} MDC citations"
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {}
+
+        # Submit all independent operations
+        futures["fair"] = executor.submit(fair_evaluation_report, url)
+        futures["mdc"] = executor.submit(
+            find_citations_mdc_duckdb,
+            url,
+            dataset_pub_date=pubdate,
+            db_path=default_mdc_db_path(),
         )
-        citations_list.append(citations_mdc)
-    else:
-        print("[JOBS] dataset_index_series_from_url - No MDC citations found")
+        futures["github"] = executor.submit(
+            find_github_mentions_for_dataset_id,
+            url,
+            dataset_pub_date=pubdate,
+        )
+
+        # Get F-UJI FAIR score
+        print(
+            f"[JOBS] dataset_index_series_from_url - Fetching F-UJI FAIR evaluation for: {url}"
+        )
+        fair_report = futures["fair"].result()
+        dataset_report["fair"] = fair_report
+
+        fair_score = None
+        if fair_report and "fair_score" in fair_report:
+            try:
+                fair_score = float(fair_report["fair_score"])
+                print(
+                    f"[JOBS] dataset_index_series_from_url - FAIR score: {fair_score}"
+                )
+            except Exception:
+                fair_score = None
+                print(
+                    "[JOBS] dataset_index_series_from_url - Could not parse FAIR score"
+                )
+        else:
+            print("[JOBS] dataset_index_series_from_url - No FAIR score available")
+
+        # Citations (MDC only)
+        print(
+            "[JOBS] dataset_index_series_from_url - Searching for citations (MDC only)"
+        )
+        print("[JOBS] dataset_index_series_from_url - Searching MDC citations")
+        citations_mdc = futures["mdc"].result()
+        if citations_mdc:
+            print(
+                f"[JOBS] dataset_index_series_from_url - Found {len(citations_mdc)} MDC citations"
+            )
+            citations_list.append(citations_mdc)
+        else:
+            print("[JOBS] dataset_index_series_from_url - No MDC citations found")
+
+        # Mentions
+        print("[JOBS] dataset_index_series_from_url - Searching for mentions")
+        print("[JOBS] dataset_index_series_from_url - Searching GitHub mentions")
+        mentions_github = futures["github"].result()
+        if mentions_github:
+            print(
+                f"[JOBS] dataset_index_series_from_url - Found {len(mentions_github)} GitHub mentions"
+            )
+            mentions_list.append(mentions_github)
+        else:
+            print("[JOBS] dataset_index_series_from_url - No GitHub mentions found")
 
     citations = merge_citations_dicts(citations_list) if citations_list else None
     if citations:
@@ -447,23 +521,6 @@ def dataset_index_series_from_url(
     else:
         print("[JOBS] dataset_index_series_from_url - No citations found")
     dataset_report["citations"] = citations
-
-    # Mentions
-    print("[JOBS] dataset_index_series_from_url - Searching for mentions")
-    mentions_list: list[list[dict]] = []
-
-    print("[JOBS] dataset_index_series_from_url - Searching GitHub mentions")
-    mentions_github = find_github_mentions_for_dataset_id(
-        url,
-        dataset_pub_date=pubdate,
-    )
-    if mentions_github:
-        print(
-            f"[JOBS] dataset_index_series_from_url - Found {len(mentions_github)} GitHub mentions"
-        )
-        mentions_list.append(mentions_github)
-    else:
-        print("[JOBS] dataset_index_series_from_url - No GitHub mentions found")
 
     mentions = merge_mentions_dicts(mentions_list) if mentions_list else None
     if mentions:
