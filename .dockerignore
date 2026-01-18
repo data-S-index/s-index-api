@@ -21,7 +21,3 @@ coverage
 
 # Environment variables
 .env
-
-# DuckDB files
-input/mdc/mdc_index.duckdb
-input/mock_norm/mock_norm.duckdb
