@@ -16,8 +16,8 @@ COPY apis ./apis
 COPY sindex ./sindex
 COPY app.py entrypoint.sh ./
 
-# Ensure the entrypoint script is executable
-RUN chmod +x entrypoint.sh
+# Convert line endings to Unix format and ensure the entrypoint script is executable
+RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
 # Set default entrypoint and command using the entrypoint script
 ENTRYPOINT [ "/bin/sh", "./entrypoint.sh" ]
