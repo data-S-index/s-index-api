@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application files
 COPY apis ./apis
 COPY sindex ./sindex
-COPY app.py utils.py entrypoint.sh ./
+COPY app.py entrypoint.sh ./
 
 # Optional: Ensure the entrypoint script is executable
 RUN chmod +x entrypoint.sh
