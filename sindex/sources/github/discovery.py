@@ -1,5 +1,3 @@
-"""GitHub mention discovery."""
-
 from __future__ import annotations
 
 import time
@@ -27,7 +25,8 @@ def find_github_mentions_for_dataset_id(
     session: requests.Session | None = None,
     token: str | None = None,
 ) -> list[dict]:
-    """Search GitHub READMEs for mentions of a dataset identifier.
+    """
+    Search GitHub READMEs for mentions of a dataset identifier.
 
     Uses `_norm_dataset_id()` to extract a normalized identifier for the search.
 
@@ -53,9 +52,6 @@ def find_github_mentions_for_dataset_id(
                 "mention_weight": <float>
             }
     """
-    print(
-        f"[GITHUB] find_github_mentions_for_dataset_id - Searching mentions for: {dataset_id}"
-    )
 
     doi_id = _norm_doi(dataset_id)
     if doi_id:
@@ -63,17 +59,9 @@ def find_github_mentions_for_dataset_id(
     else:
         search_term = dataset_id.lower()
     query = f'"{search_term}" in:file filename:README'
-    print(f"[GITHUB] find_github_mentions_for_dataset_id - Search query: {query}")
-    print(
-        f"[GITHUB] find_github_mentions_for_dataset_id - Max pages: {max_pages}, Include forks: {include_forks}"
-    )
     items = search_code(query, max_pages=max_pages, session=session, token=token)
     if not items:
-        print("[GITHUB] find_github_mentions_for_dataset_id - No search results found")
         return []
-    print(
-        f"[GITHUB] find_github_mentions_for_dataset_id - Found {len(items)} search results"
-    )
 
     repo_meta_cache: dict[str, dict[str, Any]] = {}
     repos_with_mentions: dict[str, dict[str, str]] = {}
@@ -131,7 +119,4 @@ def find_github_mentions_for_dataset_id(
             entry["mention_date"] = mention_dt
         results.append(entry)
 
-    print(
-        f"[GITHUB] find_github_mentions_for_dataset_id - Returning {len(results)} mentions"
-    )
     return results

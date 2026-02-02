@@ -1,14 +1,14 @@
-"""DataCite record normalization."""
-
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Any, Dict, List
 
-from sindex.core.dates import _norm_date_iso
+from sindex.core.dates import _norm_date_iso, get_realistic_date
 from sindex.core.ids import _norm_doi, _norm_doi_url
 from sindex.enrich.pubdate.jobs import best_publication_date_for_doi
 from sindex.metrics.dedup import dedupe_citations_by_link
 from sindex.metrics.weights import citation_weight
+
+from .utils import get_best_publication_date_datacite_record
 
 
 def slim_datacite_record(metadata: dict) -> dict:
@@ -98,12 +98,19 @@ def slim_datacite_record(metadata: dict) -> dict:
         out["publisher"] = publisher
 
     # Publication date
-    created = attr.get("created", "")
+    publication_date = get_best_publication_date_datacite_record(attr)
+    if publication_date:
+        out["publication_date"] = publication_date
+
+    # Created date
+    created = attr.get(
+        "created", ""
+    )  # This is the date DOI record was created on DataCite
     if created:
         try:
-            out["publication_date"] = _norm_date_iso(created)
+            out["created_date"] = _norm_date_iso(created)
         except ValueError:
-            pass  # skip if not valid
+            pass  # skip if issue during normalization
 
     # Creators
     creators_slim = []
@@ -215,6 +222,14 @@ def datacite_citations_block_to_records(
     """
     Convert a slimmed DataCite citations block into normalized citation records.
     """
+
+    if dataset_pub_date:
+        try:
+            dataset_pub_date = _norm_date_iso(dataset_pub_date)
+            dataset_pub_date = get_realistic_date(dataset_pub_date)
+        except ValueError:
+            dataset_pub_date = None
+
     results: List[Dict[str, object]] = []
 
     # DOIs → normalize + fetch date
@@ -230,7 +245,15 @@ def datacite_citations_block_to_records(
             "citation_link": citation_link,
         }
 
-        citation_date = best_publication_date_for_doi(citation_doi)
+        citation_date = None
+        citation_date_raw = best_publication_date_for_doi(citation_doi)
+        if citation_date_raw:
+            try:
+                norm_iso_date = _norm_date_iso(str(citation_date_raw))
+                citation_date = get_realistic_date(norm_iso_date)
+            except (ValueError, TypeError):
+                citation_date = None
+
         if citation_date:
             rec["citation_date"] = citation_date
 
@@ -254,4 +277,82 @@ def datacite_citations_block_to_records(
             }
         )
 
+    return dedupe_citations_by_link(results)
+
+
+def get_citation_date(doi: str, date_map: Dict[str, str]) -> str | None:
+    """
+    Hybrid lookup:
+    1. Check the high-speed Parquet cache (date_map) first.
+    2. Fallback to best_publication_date_for_doi only if missing.
+    """
+    # 1. High-speed cache check
+    if doi in date_map:
+        return date_map[doi]
+
+    # 2. Fallback to API/DB lookup
+    return best_publication_date_for_doi(doi)
+
+
+def datacite_citations_block_to_records_optimized(
+    target_doi: str,
+    citations: Dict[str, list] | None,
+    date_map: Dict[str, str],  # Pass the cache here
+    *,
+    dataset_pub_date: str | None = None,
+) -> List[Dict[str, Any]]:
+    if dataset_pub_date:
+        try:
+            dataset_pub_date = _norm_date_iso(dataset_pub_date)
+            dataset_pub_date = get_realistic_date(dataset_pub_date)
+        except ValueError:
+            dataset_pub_date = None
+
+    results = []
+
+    for citation_link_raw in (citations or {}).get("dois", []) or []:
+        citation_doi = _norm_doi(citation_link_raw)
+        if not citation_doi:
+            continue
+
+        # Use the hybrid lookup
+        citation_date = None
+        citation_date_raw = get_citation_date(citation_doi, date_map)
+        if citation_date_raw:
+            try:
+                norm_iso_date = _norm_date_iso(str(citation_date_raw))
+                citation_date = get_realistic_date(norm_iso_date)
+            except (ValueError, TypeError):
+                citation_date = None
+
+        rec = {
+            "dataset_id": target_doi,
+            "source": ["datacite"],
+            "citation_link": _norm_doi_url(citation_doi),
+        }
+
+        if citation_date:
+            rec["citation_date"] = citation_date
+            # Ensure citation_weight handles these dates
+            rec["citation_weight"] = citation_weight(dataset_pub_date, citation_date)
+        else:
+            rec["citation_weight"] = 1.0
+
+        results.append(rec)
+
+    # For other identifiers we cannot get a citation_date
+    for obj in (citations or {}).get("other", []) or []:
+        if not isinstance(obj, dict):
+            continue
+        id_val = (obj.get("id") or "").strip()
+        if not id_val:
+            continue
+        results.append(
+            {
+                "dataset_id": target_doi,
+                "source": ["datacite"],
+                "citation_link": id_val,
+                "citation_weight": 1.0,
+            }
+        )
     return dedupe_citations_by_link(results)

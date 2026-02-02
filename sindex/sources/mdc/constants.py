@@ -9,8 +9,7 @@ DEFAULT_MDC_PATTERN = "*.json"
 # Default DB path - file path for local development
 def _get_default_db_path():
     current_dir = os.getcwd()
-    parent_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
-    mdc_path = os.path.join(parent_dir, "input", "mdc")
+    mdc_path = os.path.join(current_dir, "input", "mdc")
     return os.path.join(mdc_path, "mdc_index.duckdb")
 
 

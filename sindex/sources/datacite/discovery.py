@@ -1,15 +1,14 @@
-"""DataCite DOI record discovery."""
-
 from typing import Dict, Iterator, Tuple
 
 import requests
 
-from sindex.core.dates import _norm_date_iso
+from sindex.core.dates import _norm_date_iso, get_realistic_date
 from sindex.core.http import make_session
 from sindex.core.ids import _norm_doi
 
 from .client import get_datacite_record_by_norm_doi
 from .constants import BASE_API_URL
+from .utils import get_best_publication_date_datacite_record
 
 
 def get_datacite_doi_record(
@@ -33,28 +32,19 @@ def get_datacite_doi_record(
         - The DOI is normalized with _norm_doi to lowercase and stripped of any "https://doi.org/" prefix.
         - DataCite api direct link: https://api.datacite.org/dois/{doi}
     """
-    print(f"[DATACITE] get_datacite_doi_record - Fetching record for DOI: {doi}")
     norm_doi = _norm_doi(doi)
     if not norm_doi:
-        print(f"[DATACITE] get_datacite_doi_record - ERROR: Invalid DOI: {doi}")
         raise ValueError(f"Invalid DOI: {doi}")
 
-    print(f"[DATACITE] get_datacite_doi_record - Normalized DOI: {norm_doi}")
     s = session or make_session(allowed_methods=("GET",))
-    result = get_datacite_record_by_norm_doi(norm_doi, session=s)
-    if result:
-        print(
-            f"[DATACITE] get_datacite_doi_record - Successfully retrieved record for: {norm_doi}"
-        )
-    else:
-        print(f"[DATACITE] get_datacite_doi_record - No record found for: {norm_doi}")
-    return result
+    return get_datacite_record_by_norm_doi(norm_doi, session=s)
 
 
 def stream_datacite_records(
     start_date: str,
     end_date: str,
     page_size: int = 1000,
+    detail: bool = True,
     session: requests.Session | None = None,  # pass a shared session
     timeout: Tuple[int, int] = (10, 240),  # (connect, read) seconds
 ) -> Iterator[Dict]:
@@ -91,6 +81,7 @@ def stream_datacite_records(
         "query": f"types.resourceTypeGeneral:Dataset AND created:[{start_date} TO {end_date}]",
         "page[size]": page_size,
         "page[cursor]": 1,
+        "detail": str(detail).lower(),
     }
 
     while True:
@@ -122,18 +113,30 @@ def fetch_datacite_pubdate(doi: str, session: requests.Session | None = None) ->
     """
     datacite_record = get_datacite_doi_record(doi)
     if not datacite_record:  # None (404 / invalid DOI)
-        return ""
+        return None
 
     attrs = datacite_record.get("attributes") or {}
 
-    # Try "created", "published", or "issued" dates in this order of preference
-    for key in ("created", "published", "issued"):
-        val = attrs.get(key)
-        if not val:
-            continue
-        try:
-            return _norm_date_iso(val)
-        except Exception:
-            continue
+    # Priority: Use "Best Date" logic (Issued date -> Published date -> Published year)
+    publication_date = get_best_publication_date_datacite_record(attrs)
 
-    return ""
+    if publication_date:
+        try:
+            realistic_date = get_realistic_date(publication_date)
+            if realistic_date:
+                return realistic_date
+        except Exception:
+            pass  # Move on to try created date
+
+    # Try "created" date
+    created_val = attrs.get("created")
+    if created_val:
+        try:
+            norm_iso = _norm_date_iso(created_val)
+            realistic_date = get_realistic_date(norm_iso)
+            if realistic_date:
+                return realistic_date
+        except Exception:
+            pass
+
+    return None

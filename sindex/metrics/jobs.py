@@ -1,6 +1,7 @@
-"""Job functions for metrics processing.
+"""Dataset index pipeline jobs.
 
-This module contains job functions for generating dataset index series.
+Builds dataset reports (metadata, citations, mentions, FAIR scores, normalization)
+from DOI or URL inputs and computes dataset index time series.
 """
 
 import os
@@ -8,8 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import duckdb
 
-
-from sindex.core.dates import _norm_date_iso, _to_datetime_utc
+from sindex.core.dates import _norm_date_iso, _to_datetime_utc, get_best_dataset_date
 from sindex.core.http import _is_reachable, is_url
 from sindex.core.ids import _norm_dataset_id, _norm_doi, _norm_doi_url, is_working_doi
 from sindex.metrics.citations import merge_citations_dicts
@@ -23,6 +23,9 @@ from sindex.sources.fuji.jobs import fair_evaluation_report
 from sindex.sources.github.discovery import find_github_mentions_for_dataset_id
 from sindex.sources.mdc.jobs import find_citations_mdc_duckdb
 from sindex.sources.openalex.jobs import find_citations_oa, get_primary_topic_for_doi
+
+# Max worker threads for parallel I/O (topic, FAIR, citations, mentions).
+DEFAULT_MAX_WORKERS = 6
 
 
 def default_mdc_db_path():
@@ -54,267 +57,191 @@ def default_norm_db_path():
 
 
 def dataset_index_series_from_doi(doi):
-    """Generate a complete dataset index series report from a DOI.
+    """Build a full dataset report and index series from a DOI.
 
-    This function orchestrates the full pipeline for processing a dataset DOI:
-    - Validates and normalizes the DOI
-    - Fetches metadata from DataCite
-    - Retrieves OpenAlex topic classification
-    - Evaluates FAIR scores using F-UJI
-    - Collects citations from multiple sources (MDC, OpenAlex, DataCite)
-    - Collects mentions from GitHub
-    - Retrieves normalization factors
-    - Calculates dataset index time series
+    Fetches metadata (DataCite), topic (OpenAlex), FAIR score (F-UJI),
+    citations (MDC, OpenAlex, DataCite), mentions (GitHub), normalization
+    factors, and computes the dataset index time series.
 
     Args:
-        doi: DOI string (e.g., "10.13026/kpb9-mt58") or DOI URL
+        doi: Dataset DOI (any format; will be normalized).
 
     Returns:
-        dict: Complete dataset report containing:
-            - input_doi, norm_doi, norm_doi_url: Identifier information
-            - metadata: Slimmed DataCite record
-            - topic: OpenAlex topic classification
-            - fair: FAIR evaluation report
-            - citations: Merged citations from all sources
-            - mentions: Merged mentions from GitHub
-            - normalization_factors: Topic/year normalization factors
-            - dataset_index_series: Time series of dataset index values
+        dict: dataset_report with keys: input_doi, norm_doi, norm_doi_url,
+              metadata, topic, fair, citations, mentions, normalization_factors,
+              dataset_index_series.
 
     Raises:
-        ValueError: If DOI format is invalid or DOI does not resolve
+        ValueError: If DOI is invalid or does not resolve.
     """
-    print(f"[JOBS] dataset_index_series_from_doi - Starting processing for DOI: {doi}")
-    # Validate DOI and normalize
-    print(
-        f"[JOBS] dataset_index_series_from_doi - Validating and normalizing DOI: {doi}"
-    )
+    print(f"[JOBS] Step 0: Building dataset report for DOI: {doi}")
+    # --- Step 1: Validate DOI and normalize ---
+    print("[JOBS] Step 1: Validating and normalizing DOI...")
     norm_doi = _norm_doi(doi)
     if not norm_doi:
-        print(
-            f"[JOBS] dataset_index_series_from_doi - ERROR: Invalid DOI format: {doi}"
-        )
         raise ValueError(f"Invalid DOI format: {doi}")
 
     norm_doi_url = _norm_doi_url(norm_doi)
-    print(
-        f"[JOBS] dataset_index_series_from_doi - Checking if DOI resolves: {norm_doi_url}"
-    )
     if not is_working_doi(norm_doi_url, allow_blocked=True):
-        print(
-            f"[JOBS] dataset_index_series_from_doi - ERROR: DOI does not resolve: {norm_doi_url}"
-        )
         raise ValueError(f"'{norm_doi_url}' does not appear to resolve.")
+    print(f"[JOBS] Step 1 done: norm_doi={norm_doi}, norm_doi_url={norm_doi_url}")
 
     dataset_report = {}
     dataset_report["input_doi"] = doi
     dataset_report["norm_doi"] = norm_doi
     dataset_report["norm_doi_url"] = norm_doi_url
 
-    # Get metadata from DataCite and create slim version
-    print(
-        f"[JOBS] dataset_index_series_from_doi - Fetching DataCite record for: {norm_doi}"
-    )
+    # --- Step 2: Get metadata from DataCite and create slim version ---
+    print("[JOBS] Step 2: Fetching DataCite metadata...")
     rec = get_datacite_doi_record(norm_doi)
 
     if not rec:
         # Happens if DOI is valid but not found in DataCite (e.g. DOI of a manuscript)
-        print(
-            f"[JOBS] dataset_index_series_from_doi - DataCite record not found for: {norm_doi}"
-        )
+        print("[JOBS] Step 2: No DataCite record; continuing without metadata.")
         slim = None
         pubdate = None
         pubyear = None
         citations_block = None
     else:
-        print(
-            "[JOBS] dataset_index_series_from_doi - DataCite record found, creating slim version"
-        )
         slim = slim_datacite_record(rec)
-        pubdate = slim.get("publication_date")
-        pub_dt = _to_datetime_utc(pubdate)
-        pubyear = pub_dt.year if pub_dt else None
+        publication_date = slim.get("publication_date")
+        created_date = slim.get("created_date")
+        pubdate = get_best_dataset_date(publication_date, created_date)
+        if pubdate:
+            pub_dt = _to_datetime_utc(pubdate)
+            pubyear = pub_dt.year if pub_dt else None
+        else:
+            pubyear = None
         citations_block = slim.get("citations")
         print(
-            f"[JOBS] dataset_index_series_from_doi - Publication date: {pubdate}, Year: {pubyear}"
+            f"[JOBS] Step 2 done: metadata slimmed, pubdate={pubdate}, pubyear={pubyear}"
         )
 
     dataset_report["metadata"] = slim
 
-    # Parallelize: OpenAlex topic, F-UJI FAIR evaluation
-    print(
-        "[JOBS] dataset_index_series_from_doi - Starting parallel fetch for topic and FAIR evaluation"
-    )
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        topic_future = executor.submit(get_primary_topic_for_doi, norm_doi)
-        fair_future = executor.submit(fair_evaluation_report, norm_doi_url)
+    # --- Steps 3–6: Run independent I/O in parallel (topic, FAIR, citations, mentions) ---
+    print("[JOBS] Steps 3–6: Running topic, FAIR, citations, mentions in parallel...")
+    mdc_db_path = default_mdc_db_path()
 
-        # Get domain (OpenAlex topic)
-        print(
-            f"[JOBS] dataset_index_series_from_doi - Fetching OpenAlex topic for: {norm_doi}"
-        )
-        topic_result = topic_future.result()
-
-        topic_id = None
-        dataset_report["topic"] = None
-
-        if topic_result and topic_result.get("topic_score", 0.0) > 0.5:
-            dataset_report["topic"] = topic_result
-            topic_id = topic_result.get("topic_id")
-            print(
-                f"[JOBS] dataset_index_series_from_doi - Topic found: {topic_id} "
-                f"(score: {topic_result.get('topic_score')})"
-            )
-        else:
-            print("[JOBS] dataset_index_series_from_doi - No valid topic found")
-
-        # Get F-UJI FAIR score
-        print(
-            f"[JOBS] dataset_index_series_from_doi - Fetching F-UJI FAIR evaluation for: {norm_doi_url}"
-        )
-        fair_report = fair_future.result()
-        dataset_report["fair"] = fair_report
-
-        fair_score = None
-        if fair_report and "fair_score" in fair_report:
-            try:
-                fair_score = float(fair_report["fair_score"])
-                print(
-                    f"[JOBS] dataset_index_series_from_doi - FAIR score: {fair_score}"
-                )
-            except Exception:
-                fair_score = None
-                print(
-                    "[JOBS] dataset_index_series_from_doi - Could not parse FAIR score"
-                )
-        else:
-            print("[JOBS] dataset_index_series_from_doi - No FAIR score available")
-
-    # Parallelize: Citations and mentions
-    print(
-        "[JOBS] dataset_index_series_from_doi - Starting parallel search for citations and mentions"
-    )
-    citations_list = []
-    mentions_list = []
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {}
-
-        # Submit all citation and mention searches
-        futures["mdc"] = executor.submit(
+    with ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as executor:
+        future_topic = executor.submit(get_primary_topic_for_doi, norm_doi)
+        future_fair = executor.submit(fair_evaluation_report, norm_doi_url)
+        future_mdc = executor.submit(
             find_citations_mdc_duckdb,
             doi,
             dataset_pub_date=pubdate,
-            db_path=default_mdc_db_path(),
+            db_path=mdc_db_path,
         )
-        futures["oa"] = executor.submit(
-            find_citations_oa, doi, dataset_pub_date=pubdate
-        )
-        futures["github"] = executor.submit(
+        future_oa = executor.submit(find_citations_oa, doi, dataset_pub_date=pubdate)
+        future_github = executor.submit(
             find_github_mentions_for_dataset_id, doi, dataset_pub_date=pubdate
         )
-
         if citations_block:
-            futures["dc"] = executor.submit(
+            future_dc = executor.submit(
                 find_citations_dc_from_citation_block,
                 doi,
                 citations_block,
                 dataset_pub_date=pubdate,
             )
-
-        # Collect results
-        print("[JOBS] dataset_index_series_from_doi - Searching MDC citations")
-        citations_mdc = futures["mdc"].result()
-        if citations_mdc:
-            print(
-                f"[JOBS] dataset_index_series_from_doi - Found {len(citations_mdc)} MDC citations"
-            )
-            citations_list.append(citations_mdc)
         else:
-            print("[JOBS] dataset_index_series_from_doi - No MDC citations found")
+            future_dc = None
 
-        print("[JOBS] dataset_index_series_from_doi - Searching OpenAlex citations")
-        citations_oa = futures["oa"].result()
-        if citations_oa:
-            print(
-                f"[JOBS] dataset_index_series_from_doi - Found {len(citations_oa)} OpenAlex citations"
-            )
-            citations_list.append(citations_oa)
+        print("[JOBS] Waiting for topic (OpenAlex)...")
+        topic_result = future_topic.result()
+        print("[JOBS] Topic done.")
+        print("[JOBS] Waiting for FAIR (F-UJI)...")
+        fair_report = future_fair.result()
+        print("[JOBS] FAIR done.")
+        print("[JOBS] Waiting for citations (MDC)...")
+        citations_mdc = future_mdc.result()
+        print("[JOBS] MDC citations done.")
+        print("[JOBS] Waiting for citations (OpenAlex)...")
+        citations_oa = future_oa.result()
+        print("[JOBS] OpenAlex citations done.")
+        print("[JOBS] Waiting for mentions (GitHub)...")
+        mentions_github = future_github.result()
+        print("[JOBS] GitHub mentions done.")
+        if future_dc:
+            print("[JOBS] Waiting for citations (DataCite block)...")
+            citations_dc = future_dc.result()
+            print("[JOBS] DataCite citations done.")
         else:
-            print("[JOBS] dataset_index_series_from_doi - No OpenAlex citations found")
+            citations_dc = None
 
-        if citations_block:
-            print(
-                "[JOBS] dataset_index_series_from_doi - Processing DataCite citation block"
-            )
-            citations_dc = futures["dc"].result()
-            if citations_dc:
-                print(
-                    f"[JOBS] dataset_index_series_from_doi - Found {len(citations_dc)} DataCite citations"
-                )
-                citations_list.append(citations_dc)
+    print("[JOBS] Steps 3–6 parallel work finished; merging results...")
 
-        print("[JOBS] dataset_index_series_from_doi - Searching GitHub mentions")
-        mentions_github = futures["github"].result()
-        if mentions_github:
-            print(
-                f"[JOBS] dataset_index_series_from_doi - Found {len(mentions_github)} GitHub mentions"
-            )
-            mentions_list.append(mentions_github)
-        else:
-            print("[JOBS] dataset_index_series_from_doi - No GitHub mentions found")
+    # Step 3: Topic
+    topic_id = None
+    dataset_report["topic"] = None
+    if topic_result and topic_result.get("topic_score", 0.0) > 0.5:
+        dataset_report["topic"] = topic_result
+        topic_id = topic_result.get("topic_id")
+        print(
+            f"[JOBS] Step 3 done: topic_id={topic_id}, score={topic_result.get('topic_score')}"
+        )
+    else:
+        print("[JOBS] Step 3 done: No topic or score ≤0.5.")
 
+    # Step 4: FAIR
+    dataset_report["fair"] = fair_report
+    fair_score = None
+    if fair_report and "fair_score" in fair_report:
+        try:
+            fair_score = float(fair_report["fair_score"])
+            print(f"[JOBS] Step 4 done: FAIR score={fair_score}")
+        except Exception:
+            fair_score = None
+            print("[JOBS] Step 4 done: Could not parse FAIR score.")
+    else:
+        print("[JOBS] Step 4 done: No FAIR score in report.")
+
+    # Step 5: Merge citations
+    citations_list = []
+    if citations_mdc:
+        citations_list.append(citations_mdc)
+    if citations_oa:
+        citations_list.append(citations_oa)
+    if citations_dc:
+        citations_list.append(citations_dc)
     citations = merge_citations_dicts(citations_list) if citations_list else None
-    if citations:
-        print(
-            f"[JOBS] dataset_index_series_from_doi - Total merged citations: {len(citations)}"
-        )
-    else:
-        print("[JOBS] dataset_index_series_from_doi - No citations found")
     dataset_report["citations"] = citations
+    total_cit = len(citations) if citations else 0
+    print(f"[JOBS] Step 5 done: Citations merged (MDC, OA, DC), total keys={total_cit}")
 
-    mentions = merge_mentions_dicts(mentions_list) if mentions_list else None
+    # Step 6: Mentions
+    mentions_list = [mentions_github] if mentions_github else []
+    mentions = merge_mentions_dicts(mentions_list)
     if mentions:
-        print(
-            f"[JOBS] dataset_index_series_from_doi - Total merged mentions: {len(mentions)}"
-        )
         dataset_report["mentions"] = mentions
+        print(f"[JOBS] Step 6 done: Mentions merged, total={len(mentions)}")
     else:
-        print("[JOBS] dataset_index_series_from_doi - No mentions found")
         dataset_report["mentions"] = None
+        print("[JOBS] Step 6 done: No mentions.")
 
-    # Normalization factors
-    print(
-        f"[JOBS] dataset_index_series_from_doi - Fetching normalization factors "
-        f"(topic_id: {topic_id}, year: {pubyear})"
-    )
+    # --- Step 7: Normalization factors from topic/year ---
+    print("[JOBS] Step 7: Loading normalization factors (topic_id, year)...")
     try:
-        norm_db_path = default_norm_db_path()
-        with duckdb.connect(norm_db_path) as con:
+        with duckdb.connect(default_norm_db_path()) as con:
             norm = get_topic_year_norm_factors(
                 con,
                 topic_id=topic_id,
                 year=pubyear,
                 table="topic_norm_factors_mock",
             )
-        print(f"[JOBS] dataset_index_series_from_doi - Normalization factors: {norm}")
+        print("[JOBS] Step 7 done: norm loaded (FT, CTw, MTw).")
     except KeyError:
         norm = None
-        print(
-            "[JOBS] dataset_index_series_from_doi - No normalization factors found (KeyError)"
-        )
+        print("[JOBS] Step 7 done: No normalization factors (KeyError).")
 
     dataset_report["normalization_factors"] = norm
 
-    # Dataset Index series
-    print("[JOBS] dataset_index_series_from_doi - Calculating dataset index series")
+    # --- Step 8: Compute dataset index time series ---
+    print("[JOBS] Step 8: Computing dataset index series (Fi, FT, CTw, MTw)...")
     Fi = (float(fair_score) / 100.0) if fair_score is not None else 0.0
 
     FT = norm["FT"] if norm else 0.5
     CTw = norm["CTw"] if norm else 1.0
     MTw = norm["MTw"] if norm else 1.0
-    print(
-        f"[JOBS] dataset_index_series_from_doi - Using factors: Fi={Fi}, FT={FT}, CTw={CTw}, MTw={MTw}"
-    )
 
     dataset_index_series = dataset_index_timeseries(
         Fi=Fi,
@@ -327,18 +254,13 @@ def dataset_index_series_from_doi(doi):
     )
 
     if dataset_index_series:
-        print(
-            f"[JOBS] dataset_index_series_from_doi - Generated dataset index series "
-            f"with {len(dataset_index_series)} data points"
-        )
         dataset_report["dataset_index_series"] = dataset_index_series
+        print(f"[JOBS] Step 8 done: Dataset index series computed (Fi={Fi:.3f}).")
     else:
-        print(
-            "[JOBS] dataset_index_series_from_doi - No dataset index series generated"
-        )
         dataset_report["dataset_index_series"] = None
+        print("[JOBS] Step 8 done: No dataset index series.")
 
-    print(f"[JOBS] dataset_index_series_from_doi - Completed processing for DOI: {doi}")
+    print("[JOBS] All steps complete. Dataset report ready.")
     return dataset_report
 
 
@@ -368,45 +290,26 @@ def dataset_index_series_from_url(
     Returns:
         dataset_report dict with citations/mentions + normalization + dataset_index_series.
     """
-    print(f"[JOBS] dataset_index_series_from_url - Starting processing for URL: {url}")
-    print(
-        f"[JOBS] dataset_index_series_from_url - Parameters: identifier={identifier}, "
-        f"pubdate={pubdate}, topic_id={topic_id}"
-    )
-    # Validate URL
+    print(f"[JOBS] Step 0: Building dataset report for URL: {url}")
+    # --- Step 1: Validate URL ---
+    print("[JOBS] Step 1: Validating URL...")
     if not isinstance(url, str) or not url.strip():
-        print(
-            "[JOBS] dataset_index_series_from_url - ERROR: url must be a non-empty string"
-        )
         raise ValueError("url must be a non-empty string")
     url = url.strip()
 
     if not url.startswith(("http://", "https://")):
-        print(
-            f"[JOBS] dataset_index_series_from_url - ERROR: Invalid URL format: {url}"
-        )
         raise ValueError(
             f"Invalid URL format: {url} (must start with http:// or https://)"
         )
     if not is_url(url):
-        print(
-            f"[JOBS] dataset_index_series_from_url - ERROR: Invalid URL format: {url}"
-        )
         raise ValueError(f"Invalid URL format: {url}")
-    print(f"[JOBS] dataset_index_series_from_url - Checking if URL is reachable: {url}")
-    if not _is_reachable(url):
-        print(
-            f"[JOBS] dataset_index_series_from_url - ERROR: URL is not reachable: {url}"
-        )
-        raise ValueError(f"'{url}' does not appear to be reachable.")
 
-    print("[JOBS] dataset_index_series_from_url - Normalizing URL and identifier")
+    if not _is_reachable(url):
+        raise ValueError(f"'{url}' does not appear to be reachable.")
+    print("[JOBS] Step 1 done: URL valid and reachable.")
+
     norm_url = _norm_dataset_id(url)
     norm_identifier = _norm_dataset_id(identifier)
-    print(
-        f"[JOBS] dataset_index_series_from_url - Normalized URL: {norm_url}, "
-        f"Normalized identifier: {norm_identifier}"
-    )
 
     dataset_report = {}
     dataset_report["input_url"] = url
@@ -414,158 +317,93 @@ def dataset_index_series_from_url(
     dataset_report["input_identifier"] = identifier
     dataset_report["norm_identifier"] = norm_identifier
 
-    # Non metadata, resolve pubdate
+    # --- Step 2: Resolve pubdate (no DataCite metadata for URL path) ---
+    print("[JOBS] Step 2: Resolving publication date...")
     if pubdate:
-        print(
-            f"[JOBS] dataset_index_series_from_url - Normalizing publication date: {pubdate}"
-        )
         try:
             pubdate = _norm_date_iso(pubdate)
-            print(
-                f"[JOBS] dataset_index_series_from_url - Normalized publication date: {pubdate}"
-            )
         except ValueError as e:
-            print(
-                f"[JOBS] dataset_index_series_from_url - ERROR: Invalid pubdate '{pubdate}': {e}"
-            )
             raise ValueError(f"Invalid pubdate '{pubdate}': {e}") from e
     pub_dt = _to_datetime_utc(pubdate)
     pubyear = pub_dt.year if pub_dt else None
-    print(
-        f"[JOBS] dataset_index_series_from_url - Publication date: {pubdate}, Year: {pubyear}"
-    )
+    print(f"[JOBS] Step 2 done: pubdate={pubdate}, pubyear={pubyear}")
 
     dataset_report["metadata"] = None
-
-    # Domain (OpenALex topic)
     dataset_report["topic"] = topic_id
-    print(f"[JOBS] dataset_index_series_from_url - Using topic_id: {topic_id}")
 
-    # Parallelize: F-UJI FAIR evaluation, MDC citations, GitHub mentions
+    # --- Steps 3–5: Run F-UJI, MDC citations, GitHub mentions in parallel ---
     print(
-        "[JOBS] dataset_index_series_from_url - Starting parallel fetch for FAIR evaluation, citations, and mentions"
+        "[JOBS] Steps 3–5: Running F-UJI, MDC citations, GitHub mentions in parallel..."
     )
-    citations_list: list[list[dict]] = []
-    mentions_list: list[list[dict]] = []
+    mdc_db_path = default_mdc_db_path()
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {}
-
-        # Submit all independent operations
-        futures["fair"] = executor.submit(fair_evaluation_report, url)
-        futures["mdc"] = executor.submit(
+    with ThreadPoolExecutor(max_workers=DEFAULT_MAX_WORKERS) as executor:
+        future_fair = executor.submit(fair_evaluation_report, url)
+        future_mdc = executor.submit(
             find_citations_mdc_duckdb,
             url,
             dataset_pub_date=pubdate,
-            db_path=default_mdc_db_path(),
+            db_path=mdc_db_path,
         )
-        futures["github"] = executor.submit(
+        future_github = executor.submit(
             find_github_mentions_for_dataset_id,
             url,
             dataset_pub_date=pubdate,
         )
 
-        # Get F-UJI FAIR score
-        print(
-            f"[JOBS] dataset_index_series_from_url - Fetching F-UJI FAIR evaluation for: {url}"
-        )
-        fair_report = futures["fair"].result()
-        dataset_report["fair"] = fair_report
+        fair_report = future_fair.result()
+        citations_mdc = future_mdc.result()
+        mentions_github = future_github.result()
 
-        fair_score = None
-        if fair_report and "fair_score" in fair_report:
-            try:
-                fair_score = float(fair_report["fair_score"])
-                print(
-                    f"[JOBS] dataset_index_series_from_url - FAIR score: {fair_score}"
-                )
-            except Exception:
-                fair_score = None
-                print(
-                    "[JOBS] dataset_index_series_from_url - Could not parse FAIR score"
-                )
-        else:
-            print("[JOBS] dataset_index_series_from_url - No FAIR score available")
+    # Step 3: FAIR
+    dataset_report["fair"] = fair_report
+    fair_score = None
+    if fair_report and "fair_score" in fair_report:
+        try:
+            fair_score = float(fair_report["fair_score"])
+            print(f"[JOBS] Step 3 done: FAIR score={fair_score}")
+        except Exception:
+            fair_score = None
+            print("[JOBS] Step 3 done: Could not parse FAIR score.")
+    else:
+        print("[JOBS] Step 3 done: No FAIR score.")
 
-        # Citations (MDC only)
-        print(
-            "[JOBS] dataset_index_series_from_url - Searching for citations (MDC only)"
-        )
-        print("[JOBS] dataset_index_series_from_url - Searching MDC citations")
-        citations_mdc = futures["mdc"].result()
-        if citations_mdc:
-            print(
-                f"[JOBS] dataset_index_series_from_url - Found {len(citations_mdc)} MDC citations"
-            )
-            citations_list.append(citations_mdc)
-        else:
-            print("[JOBS] dataset_index_series_from_url - No MDC citations found")
-
-        # Mentions
-        print("[JOBS] dataset_index_series_from_url - Searching for mentions")
-        print("[JOBS] dataset_index_series_from_url - Searching GitHub mentions")
-        mentions_github = futures["github"].result()
-        if mentions_github:
-            print(
-                f"[JOBS] dataset_index_series_from_url - Found {len(mentions_github)} GitHub mentions"
-            )
-            mentions_list.append(mentions_github)
-        else:
-            print("[JOBS] dataset_index_series_from_url - No GitHub mentions found")
-
+    # Step 4: Citations (MDC only)
+    citations_list = [citations_mdc] if citations_mdc else []
     citations = merge_citations_dicts(citations_list) if citations_list else None
-    if citations:
-        print(
-            f"[JOBS] dataset_index_series_from_url - Total merged citations: {len(citations)}"
-        )
-    else:
-        print("[JOBS] dataset_index_series_from_url - No citations found")
     dataset_report["citations"] = citations
+    print(f"[JOBS] Step 4 done: Total citations={len(citations) if citations else 0}")
 
+    # Step 5: Mentions
+    mentions_list = [mentions_github] if mentions_github else []
     mentions = merge_mentions_dicts(mentions_list) if mentions_list else None
-    if mentions:
-        print(
-            f"[JOBS] dataset_index_series_from_url - Total merged mentions: {len(mentions)}"
-        )
-        dataset_report["mentions"] = mentions
-    else:
-        print("[JOBS] dataset_index_series_from_url - No mentions found")
-        dataset_report["mentions"] = mentions
+    dataset_report["mentions"] = mentions
+    print(f"[JOBS] Step 5 done: Total mentions={len(mentions) if mentions else 0}")
 
-    # 7) Normalization factors
-    print(
-        f"[JOBS] dataset_index_series_from_url - Fetching normalization factors "
-        f"(topic_id: {topic_id}, year: {pubyear})"
-    )
+    # --- Step 6: Normalization factors ---
+    print("[JOBS] Step 6: Loading normalization factors...")
     try:
-        norm_db_path = default_norm_db_path()
-        with duckdb.connect(norm_db_path) as con:
+        with duckdb.connect(default_norm_db_path()) as con:
             norm = get_topic_year_norm_factors(
                 con,
                 topic_id=topic_id,
                 year=pubyear,
                 table="topic_norm_factors_mock",
             )
-        print(f"[JOBS] dataset_index_series_from_url - Normalization factors: {norm}")
+        print("[JOBS] Step 6 done: Normalization factors loaded.")
     except KeyError:
         norm = None
-        print(
-            "[JOBS] dataset_index_series_from_url - No normalization factors found (KeyError)"
-        )
+        print("[JOBS] Step 6 done: No normalization factors (KeyError).")
 
     dataset_report["normalization_factors"] = norm
 
-    # Dataset Index series
-    print("[JOBS] dataset_index_series_from_url - Calculating dataset index series")
+    # --- Step 7: Compute dataset index time series ---
+    print("[JOBS] Step 7: Computing dataset index series...")
     Fi = (float(fair_score) / 100.0) if fair_score is not None else 0.0
 
     FT = norm["FT"] if norm else 0.5
     CTw = norm["CTw"] if norm else 1.0
     MTw = norm["MTw"] if norm else 1.0
-    print(
-        f"[JOBS] dataset_index_series_from_url - Using factors: "
-        f"Fi={Fi}, FT={FT}, CTw={CTw}, MTw={MTw}"
-    )
 
     dataset_index_series = dataset_index_timeseries(
         Fi=Fi,
@@ -577,16 +415,7 @@ def dataset_index_series_from_url(
         MTw=MTw,
     )
 
-    if dataset_index_series:
-        print(
-            f"[JOBS] dataset_index_series_from_url - Generated dataset index series "
-            f"with {len(dataset_index_series)} data points"
-        )
-        dataset_report["dataset_index_series"] = dataset_index_series
-    else:
-        print(
-            "[JOBS] dataset_index_series_from_url - No dataset index series generated"
-        )
-        dataset_report["dataset_index_series"] = None
-    print(f"[JOBS] dataset_index_series_from_url - Completed processing for URL: {url}")
+    dataset_report["dataset_index_series"] = dataset_index_series or None
+    print(f"[JOBS] Step 7 done: Dataset index series computed (Fi={Fi:.3f}).")
+    print("[JOBS] All steps complete. Dataset report (from URL) ready.")
     return dataset_report
