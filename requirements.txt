@@ -12,6 +12,8 @@ requests
 urllib3
 
 # Data Processing
+orjson
+pandas
 python-dateutil
 duckdb==1.4.3
 
