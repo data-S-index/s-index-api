@@ -1,10 +1,3 @@
-"""DataCite harvest and citation-extraction jobs.
-
-Harvests DataCite metadata by DOI list or date range, slims records to NDJSON,
-extracts citations from citation blocks, and supports parallel/optimized batch
-processing with OpenAlex pubdate lookups.
-"""
-
 from __future__ import annotations
 
 import gzip
@@ -12,27 +5,26 @@ import multiprocessing as mp
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from multiprocessing import Pool
 from pathlib import Path
 from typing import Dict, Iterable, List
 
 import duckdb
 import orjson
-import orjson as json
 import requests
 
-from sindex.core.dates import _parse_date_strict, get_best_dataset_date
+from sindex.core.dates import _parse_date_strict
 from sindex.core.http import make_session
 from sindex.core.ids import _norm_doi
 from sindex.core.io import _iter_json_lines
-from sindex.sources.datacite.discovery import (
+
+from .discovery import (
     get_datacite_doi_record,
     stream_datacite_records,
 )
-
 from .normalize import (
-    datacite_citations_block_to_records,
-    datacite_citations_block_to_records_optimized,
+    datacite_citations_block_to_records_unified,
     slim_datacite_record,
 )
 
@@ -72,60 +64,40 @@ def harvest_datacite_doi_list_to_ndjson(
         - Files are named sequentially as `datacite-batch-0000.ndjson`,
           `datacite-batch-0001.ndjson`, etc.
     """
-    print("[DATACITE] Step 0: Starting harvest: DOI list → NDJSON batches.")
-    print("[DATACITE] Step 1: Creating session and output directory...")
     session = make_session()
     out_dir = Path(output_folder)
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[DATACITE] Step 1 done: output_folder={out_dir}")
 
     batch_index = 0
     batch = []
-    doi_count = 0
-    skipped = 0
 
     for doi in doi_list:
-        doi_count += 1
-        print(f"[DATACITE] Step 2: Fetching DOI {doi_count}: {doi} ...")
+        print(f"Fetching {doi} ...")
 
         metadata = get_datacite_doi_record(doi, session=session)
         if metadata is None:
-            print(f"[DATACITE]   No DataCite record for {doi}; skipping.")
-            skipped += 1
+            print(f"  No DataCite record found for {doi}")
             continue
 
         # Append only the metadata (the DataCite 'data' portion)
         batch.append(metadata)
-        print(f"[DATACITE]   Record received; batch size={len(batch)}")
 
         if len(batch) == batch_size:
             fname = out_dir / f"datacite-batch-{batch_index:04d}.ndjson"
-            print(
-                f"[DATACITE] Step 3: Writing batch {batch_index} ({len(batch)} records) → {fname}"
-            )
+            print(f"  Writing {len(batch)} metadata records → {fname}")
             with open(fname, "w", encoding="utf-8") as f:
                 for obj in batch:
                     f.write(json.dumps(obj, ensure_ascii=False) + "\n")
             batch = []
             batch_index += 1
-            print(f"[DATACITE] Step 3 done: batch written.")
 
     # Write final partial batch
     if batch:
         fname = out_dir / f"datacite-batch-{batch_index:04d}.ndjson"
-        print(
-            f"[DATACITE] Step 4: Writing final batch {batch_index} ({len(batch)} records) → {fname}"
-        )
+        print(f"  Writing {len(batch)} metadata records → {fname}")
         with open(fname, "w", encoding="utf-8") as f:
             for obj in batch:
                 f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        print(
-            f"[DATACITE] Step 4 done: harvest complete. Batches={batch_index + 1}, DOIs fetched={doi_count - skipped}, skipped={skipped}"
-        )
-    else:
-        print(
-            f"[DATACITE] Step 4: No remaining batch. Harvest complete. Batches={batch_index}, DOIs fetched={doi_count - skipped}, skipped={skipped}"
-        )
 
 
 def harvest_datacite_datasets_for_date_range_to_ndjson(
@@ -171,33 +143,25 @@ def harvest_datacite_datasets_for_date_range_to_ndjson(
         ValueError: If dates are invalid or end_date < start_date or window_days < 1.
         requests.exceptions.RequestException: If the harvest fails after retries/backoff logic.
     """
-    print("[DATACITE] Step 0: Starting date-range harvest (datasets → NDJSON).")
     if window_days < 1:
         raise ValueError("window_days must be >= 1")
 
     if save_folder is None:
         save_folder = "."
     os.makedirs(save_folder, exist_ok=True)
-    print(f"[DATACITE] Step 1: Save folder ready: {save_folder}")
 
-    print("[DATACITE] Step 2: Parsing date range...")
     start_date = _parse_date_strict(start_date_str)
     end_date = _parse_date_strict(end_date_str)
     if end_date < start_date:
         raise ValueError("end_date must be greater than or equal to start_date")
-    print(f"[DATACITE] Step 2 done: start={start_date}, end={end_date}")
 
     total_records = 0
     end = end_date
-    window_num = 0
 
     # Use provided session or create one (retry-aware)
-    print("[DATACITE] Step 3: Creating/using session...")
     s = session or make_session(total_retries=6, backoff=2.0)
-    print("[DATACITE] Step 3 done.")
 
     while True:
-        window_num += 1
         # Compute window start (inclusive)
         window_start = end - timedelta(days=window_days - 1)
 
@@ -212,14 +176,14 @@ def harvest_datacite_datasets_for_date_range_to_ndjson(
 
         start_iso, end_iso = window_start.isoformat(), end.isoformat()
         out_path = os.path.join(save_folder, f"datacite-{start_iso}-{end_iso}.ndjson")
-        print(
-            f"[DATACITE] Step 4 (window {window_num}): Processing {start_iso} → {end_iso} → {out_path}"
-        )
 
         # Attempt the window, on ReadTimeout shrink page_size and retry the same window
         ps = page_size
         while True:
-            print(f"[DATACITE]   Fetching records (page_size={ps}, detail={detail})...")
+            print(
+                f"Fetching records {start_iso} → {end_iso} "
+                f"(window_days={window_days}, page_size={ps}, detail={detail})"
+            )
             range_count = 0
             wrote_any = False
 
@@ -241,13 +205,11 @@ def harvest_datacite_datasets_for_date_range_to_ndjson(
                 if not wrote_any and skip_empty_files:
                     try:
                         os.remove(out_path)
-                        print(f"[DATACITE]   No records; removed empty file {out_path}")
+                        print(f"  No records; removed empty file {out_path}")
                     except OSError:
                         pass
                 else:
-                    print(
-                        f"[DATACITE]   Window done: saved {range_count} records → {out_path}"
-                    )
+                    print(f"  Saved {range_count} records → {out_path}")
                 break  # window succeeded
 
             except requests.exceptions.ReadTimeout:
@@ -284,13 +246,10 @@ def harvest_datacite_datasets_for_date_range_to_ndjson(
 
         # Stop once we've reached the requested start_date
         if window_start == start_date:
-            print(
-                f"[DATACITE] Step 5: Harvest complete. Total records: {total_records}"
-            )
+            print(f"Finished harvest. Total records saved: {total_records}")
             break
 
         # Next window ends the day before the current window starts
-        print(f"[DATACITE]   Next window; sleeping {polite_sleep_seconds}s...")
         end = window_start - timedelta(days=1)
         if polite_sleep_seconds:
             time.sleep(polite_sleep_seconds)
@@ -325,11 +284,9 @@ def batch_slim_datacite_record_to_ndjson(
           files_seen, records_read, records_kept, records_bad_json,
           output_dir, elapsed_sec, rate_rec_per_sec.
     """
-    print("[DATACITE] Step 0: Starting batch slim: NDJSON → slim NDJSON (stream).")
     src = Path(src_folder)
     dst = Path(dst_folder)
     dst.mkdir(parents=True, exist_ok=True)
-    print(f"[DATACITE] Step 1: src={src}, dst={dst}")
 
     patterns = ["*.ndjson"]
     if accept_gz:
@@ -339,15 +296,14 @@ def batch_slim_datacite_record_to_ndjson(
     for pat in patterns:
         files.extend(src.glob(pat))
     files.sort()
-    num_files = len(files)
-    print(f"[DATACITE] Step 2: Found {num_files} files to process.")
 
+    num_files = len(files)
     total_in = total_out = total_bad = 0
     t0 = time.time()
 
     def _progress(i: int, n: int):
         if one_line_progress:
-            print(f"\r[DATACITE] Step 3: [{i}/{n}] files completed", end="", flush=True)
+            print(f"\r[{i}/{n}] files completed", end="", flush=True)
 
     _progress(0, num_files)
 
@@ -397,23 +353,16 @@ def batch_slim_datacite_record_to_ndjson(
         "rate_rec_per_sec": rate,
     }
     print(
-        f"[DATACITE] Step 4: Done. files={num_files} kept={total_out:,} bad={total_bad:,} "
+        f"Done. files={num_files} kept={total_out:,} bad={total_bad:,} "
         f"time={dt:.1f}s rate≈{rate:,}/s → {summary['output_dir']}"
     )
     return summary
 
 
 def _worker_process_file(args):
-    """Process a single NDJSON(.gz) file into slim records (multiprocessing worker).
-
-    Reads each line, slims via slim_datacite_record, writes to output.
-    Used by batch_slim_datacite_record_to_ndjson_fast.
-
-    Args:
-        args: Tuple (in_path, out_path, overwrite).
-
-    Returns:
-        Tuple (records_read, records_kept, records_bad).
+    """
+    Worker function: Processes a single NDJSON file.
+    For multiprocessing.
     """
     in_path, out_path, overwrite = args
 
@@ -434,7 +383,6 @@ def _worker_process_file(args):
                 try:
                     rec = orjson.loads(line)
                     r += 1
-
                     slim = slim_datacite_record(rec)
                     f_out.write(orjson.dumps(slim) + b"\n")
                     k += 1
@@ -454,17 +402,10 @@ def batch_slim_datacite_record_to_ndjson_fast(
     one_line_progress: bool = True,
     workers: int = os.cpu_count(),
 ) -> dict:
-    """Stream-process NDJSON DataCite dumps into slim records using a process pool.
-
-    Parallel version of batch_slim_datacite_record_to_ndjson; one file per worker.
-    Returns summary dict (files_seen, records_read, records_kept, etc.).
-    """
-    print("[DATACITE] Step 0: Starting batch slim (parallel).")
     src, dst = Path(src_folder), Path(dst_folder)
     dst.mkdir(parents=True, exist_ok=True)
-    print(f"[DATACITE] Step 1: src={src}, dst={dst}")
 
-    # Gather NDJSON / NDJSON.GZ files
+    # Gather files
     patterns = ["*.ndjson"]
     if accept_gz:
         patterns.append("*.ndjson.gz")
@@ -473,12 +414,11 @@ def batch_slim_datacite_record_to_ndjson_fast(
     for pat in patterns:
         files.extend(src.glob(pat))
     files.sort()
+
     num_files = len(files)
     if num_files == 0:
-        print("[DATACITE] No files found.")
+        print("No files found.")
         return {}
-
-    print(f"[DATACITE] Step 2: Found {num_files} files.")
 
     # Prepare task arguments
     tasks = []
@@ -487,13 +427,12 @@ def batch_slim_datacite_record_to_ndjson_fast(
         suffix = ".ndjson.gz" if in_path.name.endswith(".ndjson.gz") else ".ndjson"
         out_name = in_path.name.replace(suffix, f"-slim{suffix}")
         tasks.append((in_path, dst / out_name, overwrite))
-    print(f"[DATACITE] Step 3: Prepared {len(tasks)} tasks.")
 
     total_in = total_out = total_bad = 0
     t0 = time.time()
 
     # Process in parallel
-    print(f"[DATACITE] Step 4: Processing {num_files} files using {workers} workers...")
+    print(f"Processing {num_files} files using {workers} cores...")
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
         future_to_index = {
@@ -509,19 +448,14 @@ def batch_slim_datacite_record_to_ndjson_fast(
             total_bad += b
 
             if one_line_progress:
-                print(
-                    f"\r[DATACITE] Step 4: [{idx}/{num_files}] files completed",
-                    end="",
-                    flush=True,
-                )
+                print(f"\r[{idx}/{num_files}] files completed", end="", flush=True)
 
     if one_line_progress:
-        print()
+        print()  # Line break after progress bar
 
     # Summary statistics
     dt = time.time() - t0
     rate = int(total_out / dt) if dt > 0 else 0
-    print(f"[DATACITE] Step 5: All workers finished.")
 
     summary = {
         "files_seen": num_files,
@@ -534,8 +468,8 @@ def batch_slim_datacite_record_to_ndjson_fast(
     }
 
     print(
-        f"[DATACITE] Step 6: Done. files={num_files} kept={total_out:,} bad={total_bad:,} "
-        f"time={dt:.1f}s rate≈{rate:,}/s → {summary['output_dir']}"
+        f"Done. files={num_files} kept={total_out:,} bad={total_bad:,} "
+        f"time={dt:.1f}s rate≈{rate:,}/rec-per-sec"
     )
     return summary
 
@@ -544,128 +478,236 @@ def find_citations_dc_from_citation_block(
     target_doi: str,
     citations: Dict[str, list] | None,
     *,
-    dataset_pub_date: str | None = None,
+    dataset_pubyear: int | None = None,
 ) -> List[Dict[str, object]]:
-    """Build citation records from a DataCite record's citation block.
-
-    Converts the citations dict (e.g. from slim_datacite_record) into a list
-    of citation objects with dataset_id, source, citation_link, citation_weight, etc.
-
-    Args:
-        target_doi: DOI of the dataset being cited.
-        citations: Citation block dict (e.g. keys like 'dois', 'references').
-        dataset_pub_date: Optional publication date for weight calculation.
-
-    Returns:
-        List of citation dicts.
     """
-    return datacite_citations_block_to_records(
+    Wrapper
+    """
+    return datacite_citations_block_to_records_unified(
         target_doi=target_doi,
         citations=citations,
-        dataset_pub_date=dataset_pub_date,
+        dataset_pubyear=dataset_pubyear,
     )
 
 
-def batch_find_citations_dc_from_citation_block(
-    input_folder: str, output_filepath: str
-):
-    """Scan NDJSON slim files, extract citation blocks, write flat citation records.
-
-    Reads each line, gets target_doi from identifiers and citations block,
-    converts to citation records with get_best_dataset_date for pub date.
+# ---------------------------------------------------------
+# SLIM FASTEST
+def _worker_process_batch(lines):
     """
-    input_path = Path(input_folder)
+    Receives a list of raw JSON strings.
+    Returns a list of processed bytes (ready to write) and stats.
+    """
+    output_lines = []
+    stats = {"read": 0, "kept": 0, "bad": 0}
 
-    files = list(input_path.glob("*.ndjson"))
-    total_files = len(files)
+    for line in lines:
+        # Skip empty whitespace
+        if not line.strip():
+            continue
 
-    if total_files == 0:
-        print(f"[DATACITE] No .ndjson files found in {input_folder}")
-        return
+        try:
+            # 1. Parse
+            rec = orjson.loads(line)
+            stats["read"] += 1
 
-    print(
-        f"[DATACITE] Step 0: Starting citation extraction from {total_files} files → {output_filepath}"
-    )
-    print(f"[DATACITE] Step 1: Opening output file...")
-    count_citations = 0
-    with open(output_filepath, "w", encoding="utf-8") as f_out:
-        for idx, file_path in enumerate(files, 1):
+            # 2. Transform
+            slim = slim_datacite_record(rec)
+
+            # 3. Serialize immediately (bytes)
+            # Adding \n here ensures the writer just has to dump bytes
+            output_lines.append(orjson.dumps(slim) + b"\n")
+            stats["kept"] += 1
+
+        except Exception:
+            stats["bad"] += 1
+
+    return output_lines, stats
+
+
+def _stream_lines_from_files(files, batch_size):
+    """
+    Yields batches (lists) of lines from a list of file paths.
+    Handles opening/closing files automatically.
+    """
+    batch = []
+    for filepath in files:
+        is_gz = filepath.suffix == ".gz"
+        open_func = gzip.open if is_gz else open
+
+        try:
+            with open_func(filepath, "rb") as f:
+                for line in f:
+                    batch.append(line)
+                    if len(batch) >= batch_size:
+                        yield batch
+                        batch = []
+        except Exception as e:
+            print(f"\n[Warning] Could not read file {filepath.name}: {e}")
+
+    # Yield the leftovers
+    if batch:
+        yield batch
+
+
+def batch_slim_datacite_chunked(
+    src_folder: str,
+    dst_folder: str,
+    batch_size: int = 100_000,
+    workers: int = os.cpu_count(),
+) -> dict:
+    src, dst = Path(src_folder), Path(dst_folder)
+    dst.mkdir(parents=True, exist_ok=True)
+
+    # 1. Gather all files
+    all_files = sorted(list(src.glob("*.ndjson")) + list(src.glob("*.ndjson.gz")))
+
+    if not all_files:
+        print("No files found.")
+        return {}
+
+    print(f"Found {len(all_files)} input files.")
+    print(f"Starting processing with {workers} cores. Batch size: {batch_size:,}...")
+
+    t0 = time.time()
+    total_read = 0
+    total_kept = 0
+    total_bad = 0
+    batch_idx = 0
+
+    # 2. Start Worker Pool
+    # We use imap_unordered so we can process results as soon as *any* worker finishes
+    with Pool(workers) as pool:
+        # Create the generator that feeds the pool
+        line_generator = _stream_lines_from_files(all_files, batch_size)
+
+        # Map workers to the generator
+        for result_lines, stats in pool.imap_unordered(
+            _worker_process_batch, line_generator
+        ):
+            # Update totals
+            total_read += stats["read"]
+            total_kept += stats["kept"]
+            total_bad += stats["bad"]
+
+            # Write this batch to a new file (slim-0.ndjson.gz, slim-1.ndjson.gz, etc)
+            # Using fast compression (compresslevel=1)
+            out_name = f"slim-{batch_idx}.ndjson"
+            out_path = dst / out_name
+
+            with open(out_path, "wb") as f_out:
+                f_out.writelines(result_lines)
+
+            batch_idx += 1
+
+            # Live Progress Update
             print(
-                f"\r[DATACITE] Step 2: Processing file {idx}/{total_files} ({file_path.name})",
+                f"\rProcessed: {total_read:,} lines | Batches: {batch_idx} | Bad: {total_bad}",
                 end="",
                 flush=True,
             )
 
-            with open(file_path, "r", encoding="utf-8") as f_in:
-                for line in f_in:
-                    if not line.strip():
-                        continue
+    # Final stats
+    dt = time.time() - t0
+    rate = int(total_kept / dt) if dt > 0 else 0
+    print()  # Newline after progress bar
 
-                    data = json.loads(line)
+    print("-" * 50)
+    print(f"DONE in {dt:.2f}s")
+    print(f"Total Lines Read: {total_read:,}")
+    print(f"Total Lines Kept: {total_kept:,}")
+    print(f"Processing Rate:  {rate:,} records/sec")
+    print(f"Output Files:     {batch_idx} files written to {dst}")
+    print("-" * 50)
 
-                    # Check if citations exists and is not empty/None
-                    citations = data.get("citations")
-                    if not citations or not any(citations.values()):
-                        continue
+    return {"read": total_read, "kept": total_kept, "bad": total_bad, "time": dt}
 
-                    # Extract target_doi
-                    target_doi = None
-                    for item in data.get("identifiers", []):
-                        if item.get("identifier_type") == "doi":
-                            target_doi = item.get("identifier")
-                            break
 
-                    if not target_doi:
-                        continue
+def batch_slim_datacite_chunked_tuned(
+    src_folder: str,
+    dst_folder: str,
+    batch_size: int = 5000,  # Reduced from 100k to prevent pipe clogging
+    workers: int = os.cpu_count(),
+) -> dict:
+    src, dst = Path(src_folder), Path(dst_folder)
+    dst.mkdir(parents=True, exist_ok=True)
 
-                    # Best pub date
-                    publication_date = data.get("publication_date")
-                    created_date = data.get("created_date")
-                    best_date = get_best_dataset_date(publication_date, created_date)
+    # 1. Gather all files
+    all_files = sorted(list(src.glob("*.ndjson")) + list(src.glob("*.ndjson.gz")))
+    if not all_files:
+        print("No files found.")
+        return {}
 
-                    # Process
-                    citation_records = datacite_citations_block_to_records(
-                        target_doi=target_doi,
-                        citations=citations,
-                        dataset_pub_date=best_date,
-                    )
-
-                    for record in citation_records:
-                        f_out.write(json.dumps(record) + "\n")
-                        count_citations += 1
-
-                    print(
-                        f"\r[DATACITE] Step 2: File {idx}/{total_files} | Citations: {count_citations:,}",
-                        end="",
-                        flush=True,
-                    )
-
+    print(f"Found {len(all_files)} input files.")
     print(
-        f"\n[DATACITE] Step 3: Done. Saved {count_citations:,} citations to {output_filepath}"
+        f"Streaming with {workers} workers (recycling every 50 tasks). Batch: {batch_size:,}..."
     )
+
+    t0 = time.time()
+    total_read = 0
+    total_kept = 0
+    total_bad = 0
+    batch_idx = 0
+
+    # 2. Worker Pool with Recycling (maxtasksperchild)
+    # This prevents the memory bloat/slowdown after processing millions of lines
+    with Pool(workers, maxtasksperchild=50) as pool:
+        # Create the generator
+        line_generator = _stream_lines_from_files(all_files, batch_size)
+
+        # Process
+        for result_lines, stats in pool.imap_unordered(
+            _worker_process_batch, line_generator
+        ):
+            total_read += stats["read"]
+            total_kept += stats["kept"]
+            total_bad += stats["bad"]
+
+            # Write output
+            out_name = f"slim-{batch_idx}.ndjson"
+            out_path = dst / out_name
+
+            # Write bytes directly
+            with open(out_path, "wb") as f_out:
+                f_out.writelines(result_lines)
+
+            batch_idx += 1
+
+            # Simple Progress Bar
+            if batch_idx % 10 == 0:
+                print(
+                    f"\rProcessed: {total_read:,} lines | Batches: {batch_idx} | Bad: {total_bad}",
+                    end="",
+                    flush=True,
+                )
+
+    # Final Stats
+    dt = time.time() - t0
+    rate = int(total_kept / dt) if dt > 0 else 0
+    print(f"\nDONE in {dt:.2f}s | Rate: {rate:,} rec/s")
+
+    return {"read": total_read, "kept": total_kept, "bad": total_bad, "time": dt}
+
+
+# --------------------
 
 
 def extract_unique_dois_from_citation_blocks(input_folder: str, output_parquet: str):
-    """Collect unique citation DOIs from NDJSON citation blocks and write to Parquet.
-
-    Scans all .ndjson files in input_folder, extracts citation DOIs from each
-    record's citations block, normalizes them, and writes the unique set to
-    output_parquet (ZSTD-compressed Parquet).
+    """
+    1. Iterates through all .ndjson files in a folder.
+    2. Collects a global set of unique cleaned citation DOIs.
+    3. Saves the final unique set to a Parquet file.
     """
     input_path = Path(input_folder)
     files = list(input_path.glob("*.ndjson"))
 
     if not files:
-        print(f"[DATACITE] No .ndjson files found in {input_folder}")
+        print(f"No .ndjson files found in {input_folder}")
         return
 
-    print(
-        f"[DATACITE] Step 0: Extracting unique DOIs from {len(files)} files → {output_parquet}"
-    )
     unique_dois = set()
     total_records_scanned = 0
 
-    print(f"[DATACITE] Step 1: Scanning files in {input_path.name}...")
+    print(f"Scanning {len(files)} files in {input_path.name}...")
 
     for file_path in files:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -692,64 +734,47 @@ def extract_unique_dois_from_citation_blocks(input_folder: str, output_parquet: 
                     continue
 
         print(
-            f"[DATACITE]   Finished {file_path.name}. Unique DOIs so far: {len(unique_dois):,}"
+            f"    -> Finished {file_path.name}. Current unique DOIs: {len(unique_dois):,}"
         )
-
-    print(
-        f"[DATACITE] Step 1 done: Scanned all files. Total unique DOIs: {len(unique_dois):,}"
-    )
 
     # --- SAVE TO PARQUET ---
     if unique_dois:
         print(
-            f"[DATACITE] Step 2: Exporting {len(unique_dois):,} unique DOIs to Parquet..."
+            f"\nFinal Save: Exporting {len(unique_dois):,} unique DOIs to {output_parquet}..."
         )
 
         # Prepare for DuckDB
         doi_list_data = [(d,) for d in unique_dois]
-        print(f"[DATACITE]   Prepared {len(doi_list_data):,} rows.")
 
         # Ensure directory exists
         os.makedirs(os.path.dirname(output_parquet), exist_ok=True)
-        print(f"[DATACITE]   Output dir ready.")
 
         with duckdb.connect(":memory:") as temp_conn:
             temp_conn.execute("CREATE TABLE tmp_dois(doi VARCHAR)")
             temp_conn.executemany("INSERT INTO tmp_dois VALUES (?)", doi_list_data)
-            print(f"[DATACITE]   Inserted into temp table.")
             temp_conn.execute(
                 f"COPY tmp_dois TO '{output_parquet}' (FORMAT PARQUET, COMPRESSION 'ZSTD')"
             )
 
-        print(f"[DATACITE] Step 2 done: Saved to {output_parquet}")
+        print(f"[SUCCESS] Aggregate DOI list saved to {output_parquet}")
     else:
-        print("[DATACITE] Step 2: No valid DOIs found; nothing to write.")
+        print("No valid DOIs found in any files.")
 
 
 def lookup_dates_in_oa_snapshot(db_path: str, input_parquet: str, output_parquet: str):
-    """Join a Parquet DOI list with OpenAlex pubdate table and write matches to Parquet.
-
-    Reads input_parquet (DOI column), joins on openalex_pubdate in db_path,
-    groups by DOI taking MAX(pubdate), writes result to output_parquet.
+    """
+    Joins a Parquet file of DOIs with the OpenAlex database
+    and saves the matches to a new Parquet file.
     """
     start_time = time.time()
-    print(
-        f"[DATACITE] Step 0: Joining {input_parquet} with OpenAlex DB ({db_path}) → {output_parquet}"
-    )
+    print(f"Joining {input_parquet} with OpenAlex database...")
 
     # Ensure output directory exists
-    print("[DATACITE] Step 1: Ensuring output directory exists...")
     os.makedirs(os.path.dirname(output_parquet), exist_ok=True)
 
-    # Connect to your existing database
-    print(f"[DATACITE] Step 2: Connecting to DB {db_path}...")
     con = duckdb.connect(db_path, read_only=True)
 
     try:
-        # The 'magic' query:
-        print(
-            "[DATACITE] Step 3: Executing join query (read_parquet + openalex_pubdate)..."
-        )
         # 1. read_parquet(input) acts as a virtual table
         # 2. We join it directly to the 462M row table
         # 3. We use COPY to stream results straight to the output file
@@ -765,21 +790,19 @@ def lookup_dates_in_oa_snapshot(db_path: str, input_parquet: str, output_parquet
         """
 
         con.execute(query)
-        print("[DATACITE] Step 3 done: Query executed.")
 
         elapsed = time.time() - start_time
 
         # Validation
-        print("[DATACITE] Step 4: Validating result count...")
         result_count = con.execute(
             f"SELECT count(*) FROM read_parquet('{output_parquet}')"
         ).fetchone()[0]
-        print(
-            f"[DATACITE] Step 4 done: Found {result_count:,} matches → {output_parquet} ({elapsed:.2f}s)"
-        )
+        print(f"    [SUCCESS] Found {result_count:,} matches.")
+        print(f"    [INFO] Results saved to: {output_parquet}")
+        print(f"    [INFO] Time taken: {elapsed:.2f}s")
 
     except Exception as e:
-        print(f"[DATACITE] Error during join: {e}")
+        print(f"    [!] Error during Join: {e}")
     finally:
         con.close()
 
@@ -789,37 +812,27 @@ def batch_find_citations_dc_from_citation_block_optimized(
     output_filepath: str,
     pubdate_parquet_path: str,
 ):
-    """Extract citations from slim NDJSON using a preloaded DOI→pubdate Parquet cache.
-
-    Uses datacite_citations_block_to_records_optimized with a date_map from
-    pubdate_parquet_path for faster lookups; reports progress by line count.
-    """
-    # Load DOI → pubdate map from Parquet
-    print(
-        f"[DATACITE] Step 0: Loading pubdate cache from {Path(pubdate_parquet_path).name}..."
-    )
+    # 1. Load the Parquet Cache
+    print(f"[*] Loading pubdate cache from {Path(pubdate_parquet_path).name}...")
     with duckdb.connect(":memory:") as conn:
         res = conn.execute(
             f"SELECT doi, pubdate FROM read_parquet('{pubdate_parquet_path}')"
         ).fetchall()
         date_map = dict(res)
-    print(f"[DATACITE] Step 0 done: Loaded {len(date_map):,} DOI→pubdate entries.")
 
     input_path = Path(input_folder)
     files = list(input_path.glob("*.ndjson"))
     total_files = len(files)
-    print(f"[DATACITE] Step 1: Found {total_files} NDJSON files.")
 
-    # Count total lines for progress percentage
-    print("[DATACITE] Step 2: Calculating total workload (line count)...")
+    # 2. Fast Discovery Pass for Granular Progress
+    print("[*] Calculating total workload (scanning line counts)...")
     total_lines = 0
     for f in files:
         with open(f, "rb") as f_bin:
+            # sum(1 for line in f) is the fastest way to count lines in Python
             total_lines += sum(1 for _ in f_bin)
 
-    print(f"[DATACITE] Step 2 done: {total_lines:,} lines across {total_files} files.")
-
-    print(f"[DATACITE] Step 3: Opening output file and processing lines...")
+    print(f"    -> Ready to process {total_lines:,} lines across {total_files} files.")
 
     count_citations = 0
     processed_lines = 0
@@ -838,7 +851,7 @@ def batch_find_citations_dc_from_citation_block_optimized(
                     if now - last_ui_update > 0.1:
                         pct = (processed_lines / total_lines) * 100
                         print(
-                            f"\r[DATACITE] Step 3: {pct:.2f}% | Line {processed_lines:,}/{total_lines:,} | "
+                            f"\rProgress: {pct:.2f}% | Line {processed_lines:,}/{total_lines:,} | "
                             f"File {idx}/{total_files} | Citations: {count_citations:,}",
                             end="",
                             flush=True,
@@ -849,7 +862,7 @@ def batch_find_citations_dc_from_citation_block_optimized(
                     if not line_data:
                         continue
 
-                    data = json.loads(line_data)
+                    data = orjson.loads(line_data)
                     citations = data.get("citations")
                     if not citations or not any(citations.values()):
                         continue
@@ -866,134 +879,144 @@ def batch_find_citations_dc_from_citation_block_optimized(
                     if not target_doi:
                         continue
 
-                    best_date = get_best_dataset_date(
-                        data.get("publication_date"), data.get("created_date")
-                    )
+                    dataset_pubyear = data.get("pubyear")
 
-                    citation_records = datacite_citations_block_to_records_optimized(
+                    citation_records = datacite_citations_block_to_records_unified(
                         target_doi=target_doi,
                         citations=citations,
                         date_map=date_map,
-                        dataset_pub_date=best_date,
+                        dataset_pubyear=dataset_pubyear,
                     )
 
                     for record in citation_records:
-                        f_out.write(json.dumps(record) + "\n")
+                        f_out.write(orjson.dumps(record) + "\n")
                         count_citations += 1
 
     total_time = time.time() - start_time
-    print(
-        f"\n[DATACITE] Step 4: Done. Saved {count_citations:,} citations in {total_time:.2f}s → {output_filepath}"
-    )
+    # Clear the progress line with a final report
+    print(f"\n[DONE] Saved {count_citations:,} citations in {total_time:.2f}s.")
 
 
-def init_worker(shared_counter, shared_lock):
-    """Initialize multiprocessing worker with shared counter and lock.
-
-    Called once per process in the pool; sets globals _worker_counter and
-    _worker_lock for progress reporting in process_file_chunk.
-    """
+# -------------
+def init_locks(shared_counter, shared_lock):
+    """Initializes only the locks. Cache is passed as argument."""
     global _worker_counter, _worker_lock
     _worker_counter = shared_counter
     _worker_lock = shared_lock
 
 
 def process_file_chunk(
-    file_path, start_byte, end_byte, date_map, chunk_id, output_folder
+    file_path, start_byte, end_byte, chunk_id, output_folder, date_map
 ):
-    """Process a byte range of an NDJSON file into citation records (parallel worker).
-
-    Reads lines in [start_byte, end_byte), parses citation blocks, uses date_map
-    for optimized pubdate lookup, writes to part_{chunk_id}.ndjson. Increments
-    shared counter for progress. Returns number of citation records written.
     """
+    Worker function. Receives date_map directly (fast for small caches).
+    """
+    # Imports inside worker to prevent NameError
+    from pathlib import Path
+
+    import orjson
+
+    if date_map is None:
+        raise ValueError(f"Worker {chunk_id}: Received None for date_map!")
+
     processed_in_chunk = 0
+    local_counter = 0
     part_file = Path(output_folder) / f"part_{chunk_id}.ndjson"
 
     with open(file_path, "rb") as f, open(part_file, "wb") as f_out:
         f.seek(start_byte)
         if start_byte != 0:
-            f.readline()
+            f.readline()  # Skip partial line
 
         while f.tell() < end_byte:
             line = f.readline()
             if not line:
                 break
 
-            # --- FIXED: Use the global lock explicitly ---
-            with _worker_lock:
-                _worker_counter.value += 1
+            # Update progress every 50 lines for smooth UI
+            local_counter += 1
+            if local_counter >= 50:
+                with _worker_lock:
+                    _worker_counter.value += local_counter
+                local_counter = 0
 
             try:
-                data = json.loads(line)
-                citations = data.get("citations")
-                if not citations or not any(citations.values()):
-                    continue
-
-                target_doi = next(
-                    (
-                        item.get("identifier")
-                        for item in data.get("identifiers", [])
-                        if item.get("identifier_type") == "doi"
-                    ),
-                    None,
-                )
-                if not target_doi:
-                    continue
-
-                best_date = get_best_dataset_date(
-                    data.get("publication_date"), data.get("created_date")
-                )
-
-                citation_records = datacite_citations_block_to_records_optimized(
-                    target_doi=target_doi,
-                    citations=citations,
-                    date_map=date_map,
-                    dataset_pub_date=best_date,
-                )
-
-                for record in citation_records:
-                    f_out.write(json.dumps(record) + b"\n")
-                    processed_in_chunk += 1
+                data = orjson.loads(line)
             except Exception:
                 continue
 
+            citations = data.get("citations")
+            if not citations:
+                continue
+
+            target_doi = None
+            for item in data.get("identifiers", []):
+                if item.get("identifier_type") == "doi":
+                    target_doi = item.get("identifier")
+                    break
+
+            if not target_doi:
+                continue
+
+            # CALL THE HELPER
+            citation_records = datacite_citations_block_to_records_unified(
+                target_doi=target_doi,
+                citations=citations,
+                date_map=date_map,
+                dataset_pubyear=data.get("pubyear"),
+                skip_openalex=True,
+            )
+
+            for record in citation_records:
+                chunk = orjson.dumps(record)
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                f_out.write(chunk + b"\n")
+                processed_in_chunk += 1
+
+    # Flush remaining progress
+    if local_counter > 0:
+        with _worker_lock:
+            _worker_counter.value += local_counter
+
     return processed_in_chunk
+
+
+# --- 3. MAIN FUNCTION ---
 
 
 def batch_find_citations_from_dc_parallel(
     input_file: str, output_filepath: str, pubdate_parquet_path: str
 ):
-    """Extract citations from a single large NDJSON file using multiprocessing.
-
-    Splits file by byte ranges (one chunk per CPU), runs process_file_chunk in
-    parallel with shared progress counter, then merges part_*.ndjson into
-    output_filepath. Uses pubdate_parquet_path for DOI→pubdate lookups.
-    """
     start_time = time.time()
 
-    # Load DOI → pubdate map
-    print(
-        f"[DATACITE] Step 0: Loading pubdate cache from {Path(pubdate_parquet_path).name}..."
-    )
+    # 1. LOAD CACHE (Main Process)
+    # Since file is 9MB, we load it here safely and pass it to workers.
+    print(f"[*] Loading cache from {Path(pubdate_parquet_path).name}...")
+
+    # Using DuckDB to read parquet into dict (ignores pyarrow issues usually)
     with duckdb.connect(":memory:") as conn:
         res = conn.execute(
             f"SELECT doi, pubdate FROM read_parquet('{pubdate_parquet_path}')"
         ).fetchall()
-        date_map = dict(res)
-    print(f"[DATACITE] Step 0 done: {len(date_map):,} DOI→pubdate entries.")
+        # Create dict: { '10.123/xyz': '2023', ... }
+        date_map_main = dict(res)
 
-    # Count lines for progress display
-    print("[DATACITE] Step 1: Counting lines in input file...")
+    print(f"    -> Loaded {len(date_map_main):,} dates into memory.")
+
+    # 2. PREPARE INPUT
+    print("[*] Counting exact lines in input file...")
     with open(input_file, "rb") as f:
         total_lines = sum(1 for _ in f)
-    print(f"[DATACITE] Step 1 done: {total_lines:,} lines.")
+    print(f"    -> Total workload: {total_lines:,} lines.")
 
-    # Build byte-range chunks for workers
-    print("[DATACITE] Step 2: Building byte-range chunks...")
     file_path = Path(input_file)
     file_size = file_path.stat().st_size
-    num_cpus = mp.cpu_count()
+
+    # 4 workers is safe for this setup
+    num_cpus = min(32, mp.cpu_count())
+    print(f"[*] Using {num_cpus} workers")
+
     chunk_size = file_size // num_cpus
     temp_dir = Path("./temp_parts")
     temp_dir.mkdir(exist_ok=True)
@@ -1003,26 +1026,24 @@ def batch_find_citations_from_dc_parallel(
         start = i * chunk_size
         end = (i + 1) * chunk_size if i != num_cpus - 1 else file_size
         offsets.append((start, end))
-    print(f"[DATACITE] Step 2 done: {num_cpus} chunks, temp_dir={temp_dir}")
 
-    # Shared state for progress (Windows-friendly)
-    print("[DATACITE] Step 3: Creating shared state (counter, lock)...")
     manager = mp.Manager()
     shared_counter = manager.Value("i", 0)
     shared_lock = manager.Lock()
 
-    print(f"[DATACITE] Step 4: Launching {num_cpus} workers...")
+    print("[*] Launching workers...")
 
-    total_citations_found = 0
-
+    # 3. RUN PARALLEL
     with mp.Pool(
         processes=num_cpus,
-        initializer=init_worker,
+        initializer=init_locks,
         initargs=(shared_counter, shared_lock),
     ) as pool:
         jobs = [
             pool.apply_async(
-                process_file_chunk, (input_file, s, e, date_map, i, temp_dir)
+                process_file_chunk,
+                # Pass date_map_main explicitly
+                (input_file, s, e, i, temp_dir, date_map_main),
             )
             for i, (s, e) in enumerate(offsets)
         ]
@@ -1030,32 +1051,126 @@ def batch_find_citations_from_dc_parallel(
         # Monitor Loop
         while any(not j.ready() for j in jobs):
             current = shared_counter.value
-            if total_lines > 0:
-                pct = (current / total_lines) * 100
-                print(
-                    f"\r[DATACITE] Step 4: {pct:.2f}% | Processed: {current:,}/{total_lines:,} lines",
-                    end="",
-                    flush=True,
-                )
+            pct = (current / total_lines) * 100 if total_lines > 0 else 0
+            print(
+                f"\rProgress: {pct:.2f}% | Processed: {current:,}/{total_lines:,}",
+                end="",
+                flush=True,
+            )
             time.sleep(0.5)
 
-        # Collect return values from all workers (this is the citation count)
+        # Collect results (raises error if worker crashed)
         total_citations_found = sum(j.get() for j in jobs)
-    print(
-        f"\n[DATACITE] Step 4 done: All workers finished. Citations: {total_citations_found:,}"
-    )
 
-    # Merge part files into final output
-    print(f"[DATACITE] Step 5: Merging {num_cpus} part files → {output_filepath}...")
+    # 4. MERGE
+    print(f"\n[*] Merging {num_cpus} part files into final output...")
     with open(output_filepath, "wb") as f_final:
         for part in sorted(temp_dir.glob("part_*.ndjson")):
             with open(part, "rb") as f_part:
                 f_final.write(f_part.read())
             part.unlink()
+
     temp_dir.rmdir()
-    print("[DATACITE] Step 5 done: Merge complete.")
 
     total_time = time.time() - start_time
-    print(
-        f"[DATACITE] Step 6: Done. Finished in {total_time:.2f}s. Citations: {total_citations_found:,}"
-    )
+    print(f"[DONE] Finished in {total_time:.2f}s.")
+    print(f"       Total Citations Found: {total_citations_found:,}")
+
+
+def batch_find_citations_from_dc_serial(
+    input_file: str, output_filepath: str, pubdate_parquet_path: str
+):
+    start_time = time.time()
+    print(f"[{datetime.now()}] Starting SERIAL processing...")
+
+    # 1. Load Cache (Once, in memory)
+    print(f"[*] Loading cache from {Path(pubdate_parquet_path).name}...")
+    try:
+        # Using DuckDB to read parquet (ignores pyarrow issues)
+        with duckdb.connect(":memory:") as conn:
+            res = conn.execute(
+                f"SELECT doi, pubdate FROM read_parquet('{pubdate_parquet_path}')"
+            ).fetchall()
+            date_map = dict(res)
+        print(f"    -> Loaded {len(date_map):,} dates into memory.")
+    except Exception as e:
+        print(f"!!! Error loading cache: {e}")
+        return
+
+    # 2. Count Lines for Progress Bar
+    print("[*] Counting exact lines in input file...")
+    try:
+        with open(input_file, "rb") as f:
+            total_lines = sum(1 for _ in f)
+        print(f"    -> Total workload: {total_lines:,} lines.")
+    except Exception as e:
+        print(f"!!! Error reading input file: {e}")
+        return
+
+    # 3. Process Line by Line
+    print("[*] Processing lines...")
+    processed_count = 0
+    citations_found = 0
+
+    try:
+        with open(input_file, "rb") as f_in, open(output_filepath, "wb") as f_out:
+            for line in f_in:
+                processed_count += 1
+
+                # Progress Update every 10k lines
+                if processed_count % 1000 == 0:
+                    pct = (processed_count / total_lines) * 100
+                    print(
+                        f"\rProgress: {pct:.2f}% | Found: {citations_found:,}",
+                        end="",
+                        flush=True,
+                    )
+
+                try:
+                    data = orjson.loads(line)
+                except Exception:
+                    continue
+
+                citations = data.get("citations")
+                if not citations:
+                    continue
+
+                # Extract Target DOI
+                target_doi = None
+                for item in data.get("identifiers", []):
+                    if item.get("identifier_type") == "doi":
+                        target_doi = item.get("identifier")
+                        break
+
+                if not target_doi:
+                    continue
+
+                # --- CORE LOGIC ---
+                citation_records = datacite_citations_block_to_records_unified(
+                    target_doi=target_doi,
+                    citations=citations,
+                    date_map=date_map,
+                    dataset_pubyear=data.get("pubyear"),
+                    skip_openalex=True,
+                )
+
+                # Write results
+                for record in citation_records:
+                    chunk = orjson.dumps(record)
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8")
+                    f_out.write(chunk + b"\n")
+                    citations_found += 1
+
+    except Exception as e:
+        print(f"\n\n!!! CRASH ON LINE {processed_count} !!!")
+        print(e)
+        import traceback
+
+        traceback.print_exc()
+        return
+
+    total_time = time.time() - start_time
+    print(f"\n\n[DONE] Finished in {total_time:.2f}s.")
+    print(f"       Total Lines Processed: {processed_count:,}")
+    print(f"       Total Citations Found: {citations_found:,}")
