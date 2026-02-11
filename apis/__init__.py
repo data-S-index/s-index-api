@@ -185,17 +185,24 @@ class DatasetIndexSeriesFromUrl(Resource):
         location="args",
     )
     parser.add_argument(
-        "pubdate",
+        "pubyear",
         type=str,
         required=False,
-        help="Publication date string",
+        help="Publication year string",
         location="args",
     )
     parser.add_argument(
-        "topic_id",
+        "subfield_id",
         type=str,
         required=False,
-        help="Topic ID string",
+        help="Subfield ID string",
+        location="args",
+    )
+    parser.add_argument(
+        "subfield_name",
+        type=str,
+        required=False,
+        help="Subfield name string",
         location="args",
     )
 
@@ -237,16 +244,21 @@ class DatasetIndexSeriesFromUrl(Resource):
         args = self.parser.parse_args()
         url = args["url"]
         identifier = args.get("identifier")
-        pubdate = args.get("pubdate")
-        topic_id = args.get("topic_id")
+        pubyear = args.get("pubyear")
+        subfield_id = args.get("subfield_id")
+        subfield_name = args.get("subfield_name")
         print(
             f"[API] GET /dataset-index-series-from-url - Status: Processing - "
-            f"URL: {url}, identifier: {identifier}, pubdate: {pubdate}, "
-            f"topic_id: {topic_id}"
+            f"URL: {url}, identifier: {identifier}, pubyear: {pubyear}, "
+            f"subfield_id: {subfield_id}, subfield_name: {subfield_name}"
         )
         try:
             result = dataset_index_series_from_url(
-                url, identifier=identifier, pubdate=pubdate, topic_id=topic_id
+                url,
+                identifier=identifier,
+                pubyear=pubyear,
+                subfield_id=subfield_id,
+                subfield_name=subfield_name,
             )
             print(
                 f"[API] GET /dataset-index-series-from-url - Status: Success - URL: {url}"

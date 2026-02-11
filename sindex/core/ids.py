@@ -1,5 +1,3 @@
-"""Identifier normalization utilities for DOIs and dataset IDs."""
-
 import re
 from typing import Any, Optional
 from urllib.parse import unquote, urlparse
@@ -18,6 +16,8 @@ _DOI_PATTERN = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
+_EMDB_PATTERN = re.compile(r"EMD-\d{4,5}", re.IGNORECASE)
 
 
 def _norm_doi(s: str) -> str:
@@ -67,6 +67,9 @@ def _norm_doi(s: str) -> str:
     # Sanity check: all DOI identifiers must start with "10."
     if not doi.startswith("10."):
         return ""
+
+    # Remove trailling characters we often see when extraction DOIs from text and not captured by the regex
+    doi = doi.rstrip(".,;:)])")
 
     return doi
 
