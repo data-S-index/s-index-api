@@ -9,14 +9,14 @@ Database (Prisma schema):
   - FujiScore: datasetId, score
   - Citation: datasetId, citedDate, citationWeight
   - Mention: datasetId, mentionedDate, mentionWeight
-  - DIndex (output shape): datasetId, score, created
+  - DIndex (output shape): datasetId, score, year
 
-Normalization: input/mock_norm/mock_norm.duckdb (table topic_norm_factors_mock:
-  topic_id, year, ft_median, ctw_median, mtw_median). Topic from DatasetTopic.topicId;
-  fallback topic_id "ALL" and defaults FT=0.5, CTw=1.0, MTw=1.0 if missing.
+Normalization: Subfield+year via input/subfield_norm_factors.duckdb and
+  input/openalex_topic_mapping_table.csv (required; no default). Run from s-index-api repo.
 
-Output: NDJSON under output_dir (d-index only: datasetId, score, created); normalization NDJSON under
-  norm_dir (datasetId, normalization_factors: {FT, CTw, MTw, topic_id_used, year_used, topic_id_requested, year_requested, used_year_clamp}).
+Output: NDJSON under output_dir (d-index per time point: datasetId, score, year);
+  time points are Dec 31 of each year from first (published) through last full year, then today if not Dec 31.
+  Normalization NDJSON under norm_dir (datasetId, normalization_factors: {FT, CTw, MTw, ...}).
 --------------------------------------------------------------------------------
 OTHER REPO SETUP (when this file lives in a different repository):
 --------------------------------------------------------------------------------
@@ -24,36 +24,279 @@ OTHER REPO SETUP (when this file lives in a different repository):
 2. Config: DATABASE_URL (e.g. from config import DATABASE_URL).
 3. Tables: Dataset (id, publishedAt), FujiScore (datasetId, score), Citation (datasetId, citedDate,
    citationWeight), Mention (datasetId, mentionedDate, mentionWeight), DatasetTopic (datasetId, topicId).
-4. Normalization: copy mock_norm.duckdb from s-index-api or set path; topic_norm_factors_mock.
-5. Output: d-index NDJSON per batch (datasetId, score, created); normalization NDJSON per batch (datasetId, normalization_factors).
+4. Normalization: required; no default. Run this script from s-index-api (input/subfield_norm_factors.duckdb + input/openalex_topic_mapping_table.csv).
+5. Output: d-index NDJSON per batch (datasetId, score, year); normalization NDJSON per batch (datasetId, normalization_factors).
 --------------------------------------------------------------------------------
 """
 
+import csv
 import json
+import re
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import psycopg
 from tqdm import tqdm
 
 from config import DATABASE_URL
 
-# Same defaults as sindex.metrics.datasetindex (dataset_index_timeseries)
-FT_DEFAULT = 0.5
+# Subfield normalization (local only; this file may live in a different repo).
+_HAS_SUBFIELD_NORM = True
+
+
+def load_topic_to_subfield_cache(file_path: str) -> Dict[str, str]:
+    """Load OpenAlex topic_id -> subfield_id mapping from CSV once. Key is digits-only topic id."""
+    cache: Dict[str, str] = {}
+    with open(file_path, mode="r", encoding="utf-8-sig") as f:
+        content = f.read(2048)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(content)
+            reader = csv.DictReader(f, dialect=dialect)
+        except csv.Error:
+            reader = csv.DictReader(f, delimiter="\t")
+        reader.fieldnames = (
+            [name.strip() for name in reader.fieldnames] if reader.fieldnames else []
+        )
+        if "topic_id" not in reader.fieldnames:
+            available = ", ".join(reader.fieldnames)
+            raise KeyError(
+                f"Column 'topic_id' not found. Available columns: {available}"
+            )
+        for row in reader:
+            tid = row.get("topic_id") and row["topic_id"].strip()
+            if tid:
+                normalized_id = re.sub(r"\D", "", tid)
+                if normalized_id:
+                    cache[normalized_id] = str(row.get("subfield_id", "")).strip()
+    return cache
+
+
+def get_subfield_id_from_topic_id(file_path: str, topic_id: str | int) -> Optional[str]:
+    """Resolve topic_id -> subfield_id via OpenAlex mapping CSV."""
+    normalized_id = re.sub(r"\D", "", str(topic_id))
+    with open(file_path, mode="r", encoding="utf-8-sig") as f:
+        content = f.read(2048)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(content)
+            reader = csv.DictReader(f, dialect=dialect)
+        except csv.Error:
+            reader = csv.DictReader(f, delimiter="\t")
+        reader.fieldnames = (
+            [name.strip() for name in reader.fieldnames] if reader.fieldnames else []
+        )
+        if "topic_id" not in reader.fieldnames:
+            available = ", ".join(reader.fieldnames)
+            raise KeyError(
+                f"Column 'topic_id' not found. Available columns: {available}"
+            )
+        for row in reader:
+            if row["topic_id"] and row["topic_id"].strip() == normalized_id:
+                return str(row["subfield_id"]).strip()
+    return None
+
+
+def get_subfield_id_cached(
+    topic_to_subfield: Dict[str, str], topic_id: Optional[str]
+) -> Optional[str]:
+    """Look up subfield_id from preloaded topic->subfield cache (no I/O)."""
+    if not topic_id or not topic_to_subfield:
+        return None
+    normalized_id = re.sub(r"\D", "", str(topic_id))
+    return topic_to_subfield.get(normalized_id)
+
+
+# Subfield norm cache: list of (subfield_id, pubyear, FT, CTw, MTw) for in-memory "closest past year" lookup.
+SubfieldNormRow = Tuple[str, int, float, float, float]
+# Indexed cache: subfield_id -> list of (pubyear, FT, CTw, MTw) sorted by pubyear desc for fast lookup.
+SubfieldNormCacheIndexed = Dict[str, List[Tuple[int, float, float, float]]]
+
+
+def _safe_float(value, default: float) -> float:
+    """Convert value to float; use default if None (DuckDB NULL)."""
+    return float(value) if value is not None else default
+
+
+def load_subfield_norm_cache(db_path: str) -> List[SubfieldNormRow]:
+    """Load full normalization_factors_subfields_floored table from DuckDB once.
+    NULLs in median columns are coerced to defaults (matches FT_DEFAULT, CTw_DEFAULT, MTw_DEFAULT).
+    """
+    import duckdb
+
+    query = """
+    SELECT subfield_id, pubyear, median_fair_score_3yr, median_cit_weight_3yr, median_men_weight_3yr
+    FROM normalization_factors_subfields_floored
+    WHERE pubyear >= 0
+    """
+    with duckdb.connect(db_path, read_only=True) as con:
+        rows = con.execute(query).fetchall()
+    # Coerce NULLs so we don't fail on float(None)
+    return [
+        (
+            str(r[0]),
+            int(r[1]) if r[1] is not None else 0,
+            _safe_float(r[2], 13.46),
+            _safe_float(r[3], 1.0),
+            _safe_float(r[4], 1.0),
+        )
+        for r in rows
+    ]
+
+
+def index_subfield_norm_cache(
+    cache: List[SubfieldNormRow],
+) -> SubfieldNormCacheIndexed:
+    """Group norm rows by subfield_id; each list (pubyear, FT, CTw, MTw) sorted by pubyear descending."""
+    indexed: SubfieldNormCacheIndexed = {}
+    for sid, py, ft, ctw, mtw in cache:
+        if sid not in indexed:
+            indexed[sid] = []
+        indexed[sid].append((py, ft, ctw, mtw))
+    for sid in indexed:
+        indexed[sid].sort(key=lambda t: t[0], reverse=True)  # newest first
+    return indexed
+
+
+def get_subfield_year_norm_from_cache(
+    cache: List[SubfieldNormRow], subfield_id: str, pubyear: int
+) -> Optional[Dict]:
+    """
+    Same logic as get_subfield_year_norm_factors but using preloaded list.
+    Finds row with subfield_id and pubyear <= pubyear, max(pubyear); falls back to DEFAULT.
+    """
+    # Best match for requested subfield: pubyear <= pubyear, max pubyear
+    best_ft = best_ctw = best_mtw = None
+    best_pubyear = -1
+    for sid, py, ft, ctw, mtw in cache:
+        if sid == subfield_id and py <= pubyear and py > best_pubyear:
+            best_pubyear = py
+            best_ft, best_ctw, best_mtw = ft, ctw, mtw
+    # Fallback: DEFAULT
+    def_ft = def_ctw = def_mtw = None
+    def_pubyear = -1
+    for sid, py, ft, ctw, mtw in cache:
+        if sid == "DEFAULT" and py <= pubyear and py > def_pubyear:
+            def_pubyear = py
+            def_ft, def_ctw, def_mtw = ft, ctw, mtw
+    FT = best_ft if best_ft is not None else def_ft
+    CTw = best_ctw if best_ctw is not None else def_ctw
+    MTw = best_mtw if best_mtw is not None else def_mtw
+    if FT is None or CTw is None or MTw is None:
+        return None
+    n_year_gap = (
+        (pubyear - best_pubyear) if best_pubyear >= 0 else (pubyear - def_pubyear)
+    )
+    if best_pubyear < 0:
+        method = "Default"
+    elif pubyear == best_pubyear:
+        method = "Exact Year"
+    else:
+        method = "Closest Past Year"
+    return {
+        "FT": FT,
+        "CTw": CTw,
+        "MTw": MTw,
+        "n_year_gap": n_year_gap,
+        "method": method,
+    }
+
+
+def get_subfield_year_norm_from_indexed_cache(
+    indexed: SubfieldNormCacheIndexed, subfield_id: str, pubyear: int
+) -> Optional[Dict]:
+    """Faster lookup using pre-indexed cache (by subfield_id). Same semantics as get_subfield_year_norm_from_cache."""
+
+    def find_closest(
+        rows: List[Tuple[int, float, float, float]],
+    ) -> Optional[Tuple[int, float, float, float]]:
+        for py, ft, ctw, mtw in rows:
+            if py <= pubyear:
+                return (py, ft, ctw, mtw)
+        return None
+
+    best = find_closest(indexed.get(subfield_id, []))
+    default_rows = indexed.get("DEFAULT", [])
+    def_row = find_closest(default_rows)
+    FT = (best[1] if best else def_row[1]) if (best or def_row) else None
+    CTw = (best[2] if best else def_row[2]) if (best or def_row) else None
+    MTw = (best[3] if best else def_row[3]) if (best or def_row) else None
+    if FT is None or CTw is None or MTw is None:
+        return None
+    best_pubyear = best[0] if best else -1
+    def_pubyear = def_row[0] if def_row else -1
+    n_year_gap = (
+        (pubyear - best_pubyear) if best_pubyear >= 0 else (pubyear - def_pubyear)
+    )
+    if best_pubyear < 0:
+        method = "Default"
+    elif pubyear == best_pubyear:
+        method = "Exact Year"
+    else:
+        method = "Closest Past Year"
+    return {
+        "FT": FT,
+        "CTw": CTw,
+        "MTw": MTw,
+        "n_year_gap": n_year_gap,
+        "method": method,
+    }
+
+
+def get_subfield_year_norm_factors(db_path, subfield_id, pubyear):
+    """Return normalization factors for subfield_id and pubyear from DuckDB."""
+    import duckdb
+
+    query = """
+    SELECT 
+        COALESCE(ns.median_fair_score_3yr, ns_def.median_fair_score_3yr) as FT,
+        COALESCE(ns.median_cit_weight_3yr, ns_def.median_cit_weight_3yr) as CTw,
+        COALESCE(ns.median_men_weight_3yr, ns_def.median_men_weight_3yr) as MTw,
+        (? - ns.pubyear) as n_year_gap,
+        CASE 
+            WHEN ns.subfield_id IS NULL THEN 'Default'
+            WHEN ? = ns.pubyear THEN 'Exact Year'
+            ELSE 'Closest Past Year'
+        END as method
+    FROM (SELECT 1)
+    LEFT JOIN (
+        SELECT * FROM normalization_factors_subfields_floored 
+        WHERE subfield_id = ? AND pubyear <= ? 
+        ORDER BY pubyear DESC LIMIT 1
+    ) ns ON true
+    LEFT JOIN (
+        SELECT * FROM normalization_factors_subfields_floored 
+        WHERE subfield_id = 'DEFAULT'
+    ) ns_def ON true
+    """
+    params = [pubyear, pubyear, subfield_id, pubyear]
+    with duckdb.connect(db_path) as con:
+        result = con.execute(query, params).fetchone()
+    if not result:
+        return None
+    return {
+        "FT": result[0],
+        "CTw": result[1],
+        "MTw": result[2],
+        "n_year_gap": result[3],
+        "method": result[4],
+    }
+
+
+# Same defaults as dataset_index_series_from_doi (sindex.metrics.jobs) / datasetindex.dataset_index
+FT_DEFAULT = 13.46
 CTw_DEFAULT = 1.0
 MTw_DEFAULT = 1.0
 
 # Batch processing configuration
 BATCH_SIZE = 10000
 # Number of worker processes for d-index computation (0 = single-threaded).
-# Set to 4 or more (e.g. os.cpu_count() - 1) to use multiple cores after enabling norm cache.
 N_WORKERS = 0
 
-# Normalization DuckDB: same schema as s-index-api (mock_norm.duckdb).
-# In the other repo: copy from s-index-api input/mock_norm/ and replace with real numbers later.
-NORM_TABLE = "topic_norm_factors_mock"
+# Normalization: required (subfield norm); no default. Run from s-index-api.
+NORM_TABLE = "topic_norm_factors_mock"  # used only by legacy helpers kept for reference
 FALLBACK_TOPIC_ID = "ALL"
 UNKNOWN_YEAR = -1
 
@@ -110,6 +353,108 @@ def _build_normalization_factors(
         "year_requested": year_requested,
         "used_year_clamp": used_year_clamp,
     }
+
+
+def _build_normalization_factors_subfield(
+    norm_result: Dict,
+    subfield_id_used: str,
+    year_used: Optional[int],
+    topic_id_requested: Optional[str],
+    year_requested: Optional[int],
+) -> Dict:
+    """Build normalization_factors dict from get_subfield_year_norm_factors result (matches API)."""
+    topic_id_requested_display = topic_id_requested
+    if topic_id_requested is not None:
+        full_form = _openalex_topic_id_full(topic_id_requested)
+        if full_form is not None:
+            topic_id_requested_display = full_form
+    out = {
+        "FT": round(float(norm_result["FT"]), 6),
+        "CTw": round(float(norm_result["CTw"]), 6),
+        "MTw": round(float(norm_result["MTw"]), 6),
+        "topic_id_used": subfield_id_used,
+        "year_used": year_used,
+        "topic_id_requested": topic_id_requested_display,
+        "year_requested": year_requested,
+        "used_year_clamp": False,
+    }
+    if norm_result.get("method") is not None:
+        out["method"] = norm_result["method"]
+    return out
+
+
+def _get_norm_factors_subfield(
+    norm_db_path: Optional[Path],
+    topics_table_path: Optional[Path],
+    topic_id: Optional[str],
+    year: Optional[int],
+) -> Optional[Dict]:
+    """
+    Look up FT, CTw, MTw using subfield normalization (same as dataset_index_series_from_doi).
+    Resolves topic_id -> subfield_id via OpenAlex mapping; uses get_subfield_year_norm_factors.
+    Returns normalization_factors-style dict or None (caller uses defaults).
+    """
+    if not _HAS_SUBFIELD_NORM or not norm_db_path or not norm_db_path.exists():
+        return None
+    if year is None:
+        return None
+    year = int(year)
+    subfield_id = None
+    if topic_id and topics_table_path and topics_table_path.exists():
+        try:
+            subfield_id = get_subfield_id_from_topic_id(
+                str(topics_table_path), topic_id
+            )
+        except Exception:
+            pass
+    lookup_subfield = subfield_id if subfield_id else "DEFAULT"
+    try:
+        norm = get_subfield_year_norm_factors(str(norm_db_path), lookup_subfield, year)
+    except Exception:
+        return None
+    if not norm:
+        return None
+    return _build_normalization_factors_subfield(
+        norm,
+        subfield_id_used=lookup_subfield,
+        year_used=year,
+        topic_id_requested=topic_id,
+        year_requested=year,
+    )
+
+
+def _get_norm_factors_subfield_cached(
+    topic_to_subfield: Dict[str, str],
+    subfield_norm_cache: Union[List[SubfieldNormRow], SubfieldNormCacheIndexed],
+    topic_id: Optional[str],
+    year: Optional[int],
+) -> Optional[Dict]:
+    """
+    Same as _get_norm_factors_subfield but uses preloaded caches (no file/DB I/O).
+    subfield_norm_cache can be list (SubfieldNormRow) or indexed dict for faster lookups.
+    """
+    if year is None:
+        return None
+    year = int(year)
+    subfield_id = get_subfield_id_cached(topic_to_subfield, topic_id)
+    lookup_subfield = subfield_id if subfield_id else "DEFAULT"
+    if isinstance(subfield_norm_cache, dict):
+        norm = get_subfield_year_norm_from_indexed_cache(
+            subfield_norm_cache, lookup_subfield, year
+        )
+    else:
+        norm = get_subfield_year_norm_from_cache(
+            subfield_norm_cache, lookup_subfield, year
+        )
+    if not norm:
+        return None
+    return _build_normalization_factors_subfield(
+        norm,
+        subfield_id_used=lookup_subfield,
+        year_used=year,
+        topic_id_requested=topic_id,
+        year_requested=year,
+    )
 
 
 def _clamp_year_to_available_range(
@@ -450,61 +795,63 @@ def _dataset_index_single(
     return ((Fi / FT) + (Ciw / CTw) + (Miw / MTw)) / 3.0
 
 
-def dataset_index_timeseries_external(
+def dataset_index_year_timeseries_external(
     *,
     Fi: float,
     citations: List[dict],
     mentions: List[dict],
-    pubdate: Optional[str],
+    pubyear: Optional[int],
     FT: float = FT_DEFAULT,
     CTw: float = CTw_DEFAULT,
     MTw: float = MTw_DEFAULT,
-    citation_date_key: str = "citation_date",
+    citation_year_key: str = "citation_year",
     citation_weight_key: str = "citation_weight",
-    mention_date_key: str = "mention_date",
+    mention_year_key: str = "mention_year",
     mention_weight_key: str = "mention_weight",
 ) -> List[dict]:
     """
-    Same logic as sindex.metrics.datasetindex.dataset_index_timeseries.
-    Returns [{"date": <iso>, "dataset_index": <float>}, ...].
+    Same logic as sindex.metrics.datasetindex.dataset_index_year_timeseries (per-year only).
+    Returns [{"year": <int>, "dataset_index": <float>}, ...]. Matches dataset_index_series_from_doi.
     """
-    now_utc = datetime.now(timezone.utc)
-    today_dt = datetime(now_utc.year, now_utc.month, now_utc.day, tzinfo=timezone.utc)
+    citations = citations or []
+    mentions = mentions or []
+    current_year = datetime.now(timezone.utc).year
 
-    events: List[Tuple[datetime, str, float]] = []  # (dt, type, weight)
+    events: List[Tuple[int, str, float]] = []  # (year, type, weight)
     for c in citations:
-        dt = _dt_utc_or_today(c.get(citation_date_key), today_dt=today_dt)
+        yr = c.get(citation_year_key)
+        yr = int(yr) if yr is not None else current_year
         w = float(c.get(citation_weight_key, 0.0) or 0.0)
-        events.append((dt, "citation", w))
+        events.append((yr, "citation", w))
     for m in mentions:
-        dt = _dt_utc_or_today(m.get(mention_date_key), today_dt=today_dt)
+        yr = m.get(mention_year_key)
+        yr = int(yr) if yr is not None else current_year
         w = float(m.get(mention_weight_key, 0.0) or 0.0)
-        events.append((dt, "mention", w))
+        events.append((yr, "mention", w))
     events.sort(key=lambda t: t[0])
 
-    eval_dates: List[datetime] = []
+    eval_years: List[int] = []
     seen: set = set()
-    pub_dt = _to_datetime_utc(pubdate) if pubdate else None
-    if pub_dt is not None:
-        eval_dates.append(pub_dt)
-        seen.add(pub_dt)
-    for dt, _, _ in events:
-        if dt not in seen:
-            eval_dates.append(dt)
-            seen.add(dt)
-    if pub_dt is not None:
-        rest = sorted([d for d in eval_dates if d != pub_dt])
-        eval_dates = [pub_dt] + rest
+    if pubyear is not None:
+        eval_years.append(pubyear)
+        seen.add(pubyear)
+    for yr, _, _ in events:
+        if yr not in seen:
+            eval_years.append(yr)
+            seen.add(yr)
+    if pubyear is not None:
+        rest = sorted([y for y in eval_years if y != pubyear])
+        eval_years = [pubyear] + rest
     else:
-        eval_dates = sorted(eval_dates)
-    if not eval_dates:
-        eval_dates = [today_dt]
+        eval_years = sorted(eval_years)
+    if not eval_years:
+        eval_years = [current_year]
 
     out: List[dict] = []
     ciw, miw = 0.0, 0.0
     i = 0
-    for dt in eval_dates:
-        while i < len(events) and events[i][0] <= dt:
+    for yr in eval_years:
+        while i < len(events) and events[i][0] <= yr:
             _, typ, w = events[i]
             if typ == "citation":
                 ciw += w
@@ -512,12 +859,7 @@ def dataset_index_timeseries_external(
                 miw += w
             i += 1
         idx = _dataset_index_single(Fi=Fi, Ciw=ciw, Miw=miw, FT=FT, CTw=CTw, MTw=MTw)
-        out.append(
-            {
-                "date": dt.isoformat().replace("+00:00", "Z"),
-                "dataset_index": idx,
-            }
-        )
+        out.append({"year": yr, "dataset_index": idx})
     return out
 
 
@@ -529,7 +871,7 @@ def serialize_datetime(obj):
 
 
 def write_batch_to_file(batch: list, file_number: int, output_dir: Path) -> None:
-    """Write a batch of d-index records to an NDJSON file (datasetId, score, created only; no normalization)."""
+    """Write a batch of d-index records to an NDJSON file (datasetId, score, year only; no normalization)."""
     file_name = f"{file_number}.ndjson"
     file_path = output_dir / file_name
     with open(file_path, "w", encoding="utf-8") as f:
@@ -537,7 +879,7 @@ def write_batch_to_file(batch: list, file_number: int, output_dir: Path) -> None
             dindex_line = {
                 "datasetId": record["datasetId"],
                 "score": record["score"],
-                "created": record["created"],
+                "year": record["year"],
             }
             f.write(
                 json.dumps(dindex_line, ensure_ascii=False, default=serialize_datetime)
@@ -581,24 +923,32 @@ def _process_one_dataset_to_records(
     norm_cache: Optional[Dict[Tuple[str, int], Tuple[float, float, float]]],
     year_range_by_topic: Optional[Dict[str, Tuple[int, int]]],
     norm_db_path: Optional[Path],
+    use_subfield_norm: bool = False,
+    topics_table_path: Optional[Path] = None,
+    topic_to_subfield: Optional[Dict[str, str]] = None,
+    subfield_norm_cache: Optional[
+        Union[List[SubfieldNormRow], SubfieldNormCacheIndexed]
+    ] = None,
 ) -> List[dict]:
     """
     Compute d-index time series for one dataset and return list of records (for multiprocessing).
-    Normalize: empty topic_id -> None. If norm_cache/year_range_by_topic are set, use cache; else DuckDB.
+    Normalize: if use_subfield_norm use subfield (cached if topic_to_subfield/subfield_norm_cache
+    provided, else DB/CSV); else if norm_cache/year_range_by_topic set use cache; else topic DuckDB.
     """
     if topic_id is not None and (not isinstance(topic_id, str) or not topic_id.strip()):
         topic_id = None
     year = published_at.year if published_at else None
-    if norm_cache is not None and year_range_by_topic is not None:
-        norm = _get_norm_factors_from_cache(
-            norm_cache, year_range_by_topic, topic_id, year
-        )
+    if use_subfield_norm:
+        if topic_to_subfield is not None and subfield_norm_cache is not None:
+            norm = _get_norm_factors_subfield_cached(
+                topic_to_subfield, subfield_norm_cache, topic_id, year
+            )
+        else:
+            norm = _get_norm_factors_subfield(
+                norm_db_path, topics_table_path, topic_id, year
+            )
     else:
-        norm = (
-            _get_norm_factors_from_duckdb(norm_db_path, topic_id, year)
-            if norm_db_path
-            else None
-        )
+        norm = None
     if norm is not None:
         FT, CTw, MTw = norm["FT"], norm["CTw"], norm["MTw"]
         normalization_factors = norm
@@ -608,7 +958,7 @@ def _process_one_dataset_to_records(
             FT=FT,
             CTw=CTw,
             MTw=MTw,
-            topic_id_used=FALLBACK_TOPIC_ID,
+            topic_id_used=FALLBACK_TOPIC_ID if not use_subfield_norm else "DEFAULT",
             year_used=year,
             topic_id_requested=topic_id,
             year_requested=year,
@@ -630,6 +980,7 @@ def _process_one_dataset_to_records(
             {
                 "datasetId": dataset_id,
                 "score": d_index,
+                "year": (time_point.year if time_point else None),
                 "created": (time_point.isoformat() if time_point else None),
                 "normalization_factors": normalization_factors,
             }
@@ -644,8 +995,13 @@ def _process_chunk_of_datasets(args: Tuple) -> List[dict]:
         norm_cache,
         year_range_by_topic,
         norm_db_path,
+        use_subfield_norm,
+        topics_table_path,
+        topic_to_subfield,
+        subfield_norm_cache,
     ) = args
     norm_db_path = Path(norm_db_path) if norm_db_path else None
+    topics_table_path = Path(topics_table_path) if topics_table_path else None
     out: List[dict] = []
     for (
         dataset_id,
@@ -666,9 +1022,32 @@ def _process_chunk_of_datasets(args: Tuple) -> List[dict]:
                 norm_cache=norm_cache,
                 year_range_by_topic=year_range_by_topic,
                 norm_db_path=norm_db_path,
+                use_subfield_norm=use_subfield_norm,
+                topics_table_path=topics_table_path,
+                topic_to_subfield=topic_to_subfield,
+                subfield_norm_cache=subfield_norm_cache,
             )
         )
     return out
+
+
+def _year_from_date(d: Optional[datetime]) -> Optional[int]:
+    """Extract calendar year from datetime/date or None."""
+    if d is None:
+        return None
+    if hasattr(d, "year"):
+        return int(d.year)
+    return None
+
+
+def _year_from_date_str(s: Optional[str]) -> Optional[int]:
+    """Extract calendar year from ISO date string (YYYY-MM-DD...) or None."""
+    if not s or not isinstance(s, str):
+        return None
+    s = s.strip()[:4]
+    if len(s) == 4 and s.isdigit():
+        return int(s)
+    return None
 
 
 def process_dataset(
@@ -682,33 +1061,48 @@ def process_dataset(
     MTw: float = MTw_DEFAULT,
 ) -> List[Tuple[datetime, float]]:
     """
-    Calculate d-index at all time points using same logic as dataset_index_timeseries.
-    FAIR score is normalized to [0,1] as Fi = fair_score_raw / 100.
+    Calculate d-index per year only (same as dataset_index_series_from_doi).
+    FAIR score is in [0, 100]; Fi is used as-is. Returns one (created, score) per evaluation year.
     """
-    # Fi in [0, 1] as in s-index-api jobs
-    Fi = (float(fair_score_raw) / 100.0) if fair_score_raw is not None else 0.0
-    Fi = max(0.0, min(1.0, Fi))
+    # Fi in [0, 100] to match sindex.metrics.datasetindex.dataset_index
+    Fi = float(fair_score_raw) if fair_score_raw is not None else 0.0
+    Fi = max(0.0, min(100.0, Fi))
 
-    pubdate_iso = published_at.isoformat() if published_at else None
-    citations_list = [
-        {
-            "citation_date": (d.isoformat() if d else None),
-            "citation_weight": w,
-        }
-        for d, w in citations
-    ]
-    series = dataset_index_timeseries_external(
+    pubyear = _year_from_date(published_at) if published_at else None
+    current_year = datetime.now(timezone.utc).year
+
+    citations_list = []
+    for d, w in citations:
+        yr = _year_from_date(d)
+        if yr is None:
+            yr = current_year
+        citations_list.append({"citation_year": yr, "citation_weight": float(w)})
+
+    mentions_list = []
+    for m in mentions:
+        yr = m.get("mention_year")
+        if yr is None:
+            yr = _year_from_date_str(m.get("mention_date"))
+        if yr is None:
+            yr = current_year
+        else:
+            yr = int(yr)
+        w = float(m.get("mention_weight", 0.0) or 0.0)
+        mentions_list.append({"mention_year": yr, "mention_weight": w})
+
+    series = dataset_index_year_timeseries_external(
         Fi=Fi,
         citations=citations_list,
-        mentions=mentions,
-        pubdate=pubdate_iso,
+        mentions=mentions_list,
+        pubyear=pubyear,
         FT=FT,
         CTw=CTw,
         MTw=MTw,
     )
+    utc = timezone.utc
     return [
         (
-            datetime.fromisoformat(rec["date"].replace("Z", "+00:00")),
+            datetime(rec["year"], 1, 1, tzinfo=utc),
             rec["dataset_index"],
         )
         for rec in series
@@ -725,26 +1119,41 @@ def main() -> None:
     downloads_dir = home_dir / "Downloads"
     output_dir = downloads_dir / "database" / "dindex"
     norm_dir = downloads_dir / "database" / "normalization"
-    # Prefer s-index-api layout (input/mock_norm/mock_norm.duckdb); fallback for other repo.
-    norm_db_path = Path.cwd() / "input" / "mock_norm" / "mock_norm.duckdb"
-    if not norm_db_path.exists():
-        norm_db_path = Path.cwd() / "mock_norm.duckdb"
-    if norm_db_path.exists():
-        print(f"  Normalization DB: {norm_db_path}")
-    else:
-        norm_db_path = None
-        print("  Normalization DB: not found (using default FT, CTw, MTw)")
+    # Subfield normalization is required; it lives in s-index-api (norm DB + topics table).
+    if not _HAS_SUBFIELD_NORM:
+        print(
+            "  ERROR: Subfield normalization is required. Run this script from the s-index-api repo."
+        )
+        exit(1)
+    subfield_norm_path = Path("subfield_norm_factors.duckdb")
+    topics_table_path = Path("openalex_topic_mapping_table.csv")
+    if not subfield_norm_path.exists() or not topics_table_path.exists():
+        print(
+            "  ERROR: Subfield normalization required. Missing subfield_norm_factors.duckdb or openalex_topic_mapping_table.csv"
+        )
+        exit(1)
+    norm_db_path = subfield_norm_path
+    use_subfield_norm = True
+    print(f"  Normalization DB (subfield): {norm_db_path}")
+    print(f"  Topics table: {topics_table_path}")
 
-    # Preload normalization table into memory (one DuckDB read; huge speedup)
+    # Load subfield caches once (avoids opening CSV/DuckDB per dataset; enables parallel workers).
+    print("  Loading topic -> subfield cache (CSV)...")
+    topic_to_subfield: Dict[str, str] = load_topic_to_subfield_cache(
+        str(topics_table_path)
+    )
+    print(f"    Loaded {len(topic_to_subfield):,} topic -> subfield mappings")
+    print("  Loading subfield norm factors (DuckDB)...")
+    subfield_norm_list: List[SubfieldNormRow] = load_subfield_norm_cache(
+        str(norm_db_path)
+    )
+    subfield_norm_cache: SubfieldNormCacheIndexed = index_subfield_norm_cache(
+        subfield_norm_list
+    )
+    print(f"    Loaded {len(subfield_norm_list):,} subfield norm rows (indexed)")
+
     norm_cache: Optional[Dict[Tuple[str, int], Tuple[float, float, float]]] = None
     year_range_by_topic: Optional[Dict[str, Tuple[int, int]]] = None
-    if norm_db_path:
-        print("  Loading normalization table into memory...")
-        norm_cache, year_range_by_topic = _load_norm_cache(norm_db_path)
-        if norm_cache is not None:
-            print(f"  Loaded {len(norm_cache):,} norm rows")
-        else:
-            print("  Norm cache failed (will use per-dataset DuckDB lookups)")
 
     print(f"Output directory: {output_dir}")
     print(f"Normalization directory: {norm_dir}")
@@ -926,6 +1335,14 @@ def main() -> None:
                                     norm_cache,
                                     year_range_by_topic,
                                     str(norm_db_path) if norm_db_path else None,
+                                    use_subfield_norm,
+                                    (
+                                        str(topics_table_path)
+                                        if topics_table_path
+                                        else None
+                                    ),
+                                    topic_to_subfield,
+                                    subfield_norm_cache,
                                 )
                             )
                         # norm_db_path must be passed as str for pickling; worker will use Path
@@ -935,7 +1352,7 @@ def main() -> None:
                             ):
                                 batch_records.extend(rec_list)
                     else:
-                        # Sequential path
+                        # Sequential path (uses in-memory caches when available)
                         for dataset_id, published_at, topic_id in datasets_batch:
                             if topic_id is not None and (
                                 not isinstance(topic_id, str) or not topic_id.strip()
@@ -945,21 +1362,15 @@ def main() -> None:
                             citations = citations_by_dataset.get(dataset_id, [])
                             mentions = mentions_by_dataset.get(dataset_id, [])
                             year = published_at.year if published_at else None
-                            if norm_cache is not None and year_range_by_topic:
-                                norm = _get_norm_factors_from_cache(
-                                    norm_cache,
-                                    year_range_by_topic,
+                            if use_subfield_norm:
+                                norm = _get_norm_factors_subfield_cached(
+                                    topic_to_subfield,
+                                    subfield_norm_cache,
                                     topic_id,
                                     year,
                                 )
                             else:
-                                norm = (
-                                    _get_norm_factors_from_duckdb(
-                                        norm_db_path, topic_id, year
-                                    )
-                                    if norm_db_path
-                                    else None
-                                )
+                                norm = None
                             if norm is not None:
                                 FT = norm["FT"]
                                 CTw = norm["CTw"]
@@ -973,7 +1384,11 @@ def main() -> None:
                                     FT=FT,
                                     CTw=CTw,
                                     MTw=MTw,
-                                    topic_id_used=FALLBACK_TOPIC_ID,
+                                    topic_id_used=(
+                                        FALLBACK_TOPIC_ID
+                                        if not use_subfield_norm
+                                        else "DEFAULT"
+                                    ),
                                     year_used=year,
                                     topic_id_requested=topic_id,
                                     year_requested=year,
@@ -994,6 +1409,9 @@ def main() -> None:
                                     {
                                         "datasetId": dataset_id,
                                         "score": d_index,
+                                        "year": (
+                                            time_point.year if time_point else None
+                                        ),
                                         "created": (
                                             time_point.isoformat()
                                             if time_point
