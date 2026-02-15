@@ -73,8 +73,10 @@ def get_openalex_record(
           non-404 errors after attempting to parse JSON.
     """
     url = f"{OA_BASE_URL}{path}"
+    print(f"[status] get_openalex_record: GET {path} (timeout={timeout}s)...")
     r = session.get(url, params=params, timeout=timeout)
     if r.status_code == 404:
+        print(f"[status] get_openalex_record: 404 for {path}")
         return None
 
     try:
@@ -89,7 +91,11 @@ def get_openalex_record(
         ) from e
 
     try:
-        return r.json()
+        out = r.json()
+        print(
+            f"[status] get_openalex_record: got JSON for {path} (status={r.status_code})"
+        )
+        return out
     except ValueError as e:
         snippet = (r.text or "")[:300]
         raise RuntimeError(

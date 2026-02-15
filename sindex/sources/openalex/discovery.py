@@ -23,13 +23,21 @@ def get_openalex_doi_record(
     Resolve a dataset DOI/DOI-URL to the OpenAlex work record (raw JSON).
     Returns None if the DOI is invalid or OA returns 404.
     """
+    print(f"[status] get_openalex_doi_record: normalizing DOI {doi!r}...")
     doi_url = _norm_doi_url(doi)
     if not doi_url:
+        print(f"[status] get_openalex_doi_record: invalid DOI, skipping {doi!r}")
         return None
 
+    path = f"/works/{doi_url}"
+    print(f"[status] get_openalex_doi_record: requesting OpenAlex {path}...")
     s = session or make_openalex_session()
     params = {"mailto": mailto} if mailto else None
-    payload = get_openalex_record(f"/works/{doi_url}", session=s, params=params)
+    payload = get_openalex_record(path, session=s, params=params)
+    if payload is None:
+        print(f"[status] get_openalex_doi_record: no record (404) for {path}")
+    else:
+        print(f"[status] get_openalex_doi_record: got record for {path}")
     return payload
 
 
