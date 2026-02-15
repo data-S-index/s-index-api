@@ -69,14 +69,19 @@ def get_primary_topic_for_doi(doi: str) -> dict | None:
     Returns:
         Flat dict with topic + hierarchy info, or None.
     """
+    print(f"[status] get_primary_topic_for_doi: fetching OpenAlex work record for DOI {doi!r}...")
     work = get_openalex_doi_record(doi)
     if not work:
+        print(f"[status] get_primary_topic_for_doi: OpenAlex record not found for {doi!r}")
         return None
 
+    print(f"[status] get_primary_topic_for_doi: record received, extracting primary topic...")
     pt = work.get("primary_topic")
     if not pt:
+        print(f"[status] get_primary_topic_for_doi: no primary_topic on work for {doi!r}")
         return None
 
+    print(f"[status] get_primary_topic_for_doi: primary topic found for {doi!r}")
     return {
         "doi": doi,
         "work_id": work.get("id"),

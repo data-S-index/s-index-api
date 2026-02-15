@@ -45,7 +45,7 @@ python app.py --host $HOST --port $PORT
 or
 
 ```bash
-flask run --debug
+python app.py --dev # for flask development server
 ```
 
 For production mode:

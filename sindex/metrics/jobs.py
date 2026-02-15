@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 
 from sindex.core.dates import is_realistic_integer_year
+from sindex.utils import timed_block, timed_call
 from sindex.core.http import _is_reachable, is_url
 from sindex.core.ids import _norm_dataset_id, _norm_doi, _norm_doi_url, is_working_doi
 from sindex.metrics.citations import merge_citations_dicts
@@ -41,22 +42,22 @@ def topics_table_path():
 
 
 def dataset_index_series_from_doi(doi):
-    print("[status] Validating and normalizing DOI...")
-    norm_doi = _norm_doi(doi)
-    if not norm_doi:
-        raise ValueError(f"Invalid DOI format: {doi}")
+    with timed_block("Validating and normalizing DOI"):
+        norm_doi = _norm_doi(doi)
+        if not norm_doi:
+            raise ValueError(f"Invalid DOI format: {doi}")
 
-    norm_doi_url = _norm_doi_url(norm_doi)
-    if not is_working_doi(norm_doi_url, allow_blocked=True):
-        raise ValueError(f"'{norm_doi_url}' does not appear to resolve.")
+        norm_doi_url = _norm_doi_url(norm_doi)
+        if not is_working_doi(norm_doi_url, allow_blocked=True):
+            raise ValueError(f"'{norm_doi_url}' does not appear to resolve.")
 
     dataset_report = {}
     dataset_report["input_doi"] = doi
     dataset_report["norm_doi"] = norm_doi
     dataset_report["norm_doi_url"] = norm_doi_url
 
-    print("[status] Fetching metadata from DataCite...")
-    rec = get_datacite_doi_record(norm_doi)
+    with timed_block("Fetching metadata from DataCite"):
+        rec = get_datacite_doi_record(norm_doi)
 
     if not rec:
         print(
@@ -66,15 +67,17 @@ def dataset_index_series_from_doi(doi):
         pubyear = None
         citations_block = None
     else:
-        print("[status] Building slim DataCite record...")
-        slim = slim_datacite_record(rec)
-        pubyear = slim.get("pubyear")
-        citations_block = slim.get("citations")
+        with timed_block("Building slim DataCite record"):
+            slim = slim_datacite_record(rec)
+            pubyear = slim.get("pubyear")
+            citations_block = slim.get("citations")
 
     dataset_report["metadata"] = slim
 
-    print("[status] Getting OpenAlex primary topic...")
-    topic_result = get_primary_topic_for_doi(norm_doi)
+    with timed_block("Getting OpenAlex primary topic"):
+        print(f"[status] get_primary_topic_for_doi: starting for norm_doi={norm_doi!r}")
+        topic_result = get_primary_topic_for_doi(norm_doi)
+        print(f"[status] get_primary_topic_for_doi: finished (result={'ok' if topic_result else 'None'})")
 
     subfield_id = None
     dataset_report["topic"] = None
@@ -96,39 +99,61 @@ def dataset_index_series_from_doi(doi):
     norm_path = default_norm_db_path()
 
     def _task_fair():
-        return ("fair", fair_evaluation_report(norm_doi_url))
+        return ("fair", timed_call("FAIR score", fair_evaluation_report, norm_doi_url))
 
     def _task_citations_mdc():
         return (
             "citations_mdc",
-            find_citations_mdc_duckdb(doi, dataset_pubyear=pubyear, db_path=mdc_path),
+            timed_call(
+                "citations (MDC)",
+                find_citations_mdc_duckdb,
+                doi,
+                dataset_pubyear=pubyear,
+                db_path=mdc_path,
+            ),
         )
 
     def _task_citations_oa():
-        return ("citations_oa", find_citations_oa(doi, dataset_pubyear=pubyear))
+        return (
+            "citations_oa",
+            timed_call("citations (OpenAlex)", find_citations_oa, doi, dataset_pubyear=pubyear),
+        )
 
     def _task_citations_dc():
         if not citations_block:
             return ("citations_dc", None)
         return (
             "citations_dc",
-            find_citations_dc_from_citation_block(
-                doi, citations_block, dataset_pubyear=pubyear
+            timed_call(
+                "citations (DataCite)",
+                find_citations_dc_from_citation_block,
+                doi,
+                citations_block,
+                dataset_pubyear=pubyear,
             ),
         )
 
     def _task_mentions_github():
         return (
             "mentions_github",
-            find_github_mentions_for_dataset_id(doi, dataset_pubyear=pubyear),
+            timed_call(
+                "mentions (GitHub)",
+                find_github_mentions_for_dataset_id,
+                doi,
+                dataset_pubyear=pubyear,
+            ),
         )
 
     def _task_norm():
         try:
             return (
                 "norm",
-                get_subfield_year_norm_factors(
-                    norm_path, subfield_id=subfield_id, pubyear=pubyear
+                timed_call(
+                    "normalization factors",
+                    get_subfield_year_norm_factors,
+                    norm_path,
+                    subfield_id=subfield_id,
+                    pubyear=pubyear,
                 ),
             )
         except KeyError:
@@ -172,13 +197,13 @@ def dataset_index_series_from_doi(doi):
         except Exception:
             fair_score = None
 
-    print("[status] Merging citations...")
-    citations = merge_citations_dicts(citations_list) if citations_list else None
+    with timed_block("Merging citations"):
+        citations = merge_citations_dicts(citations_list) if citations_list else None
     dataset_report["citations"] = citations
 
-    print("[status] Merging mentions...")
-    mentions_list = [mentions_github] if mentions_github else []
-    mentions = merge_mentions_dicts(mentions_list)
+    with timed_block("Merging mentions"):
+        mentions_list = [mentions_github] if mentions_github else []
+        mentions = merge_mentions_dicts(mentions_list)
     if mentions:
         dataset_report["mentions"] = mentions
     else:
@@ -186,21 +211,21 @@ def dataset_index_series_from_doi(doi):
 
     dataset_report["normalization_factors"] = norm
 
-    print("[status] Computing dataset index time series...")
-    Fi = fair_score if fair_score is not None else 0.0
-    FT = norm["FT"] if norm else 13.46
-    CTw = norm["CTw"] if norm else 1.0
-    MTw = norm["MTw"] if norm else 1.0
+    with timed_block("Computing dataset index time series"):
+        Fi = fair_score if fair_score is not None else 0.0
+        FT = norm["FT"] if norm else 13.46
+        CTw = norm["CTw"] if norm else 1.0
+        MTw = norm["MTw"] if norm else 1.0
 
-    dataset_index_series = dataset_index_year_timeseries(
-        Fi=Fi,
-        citations=citations,
-        mentions=mentions,
-        pubyear=pubyear,
-        FT=FT,
-        CTw=CTw,
-        MTw=MTw,
-    )
+        dataset_index_series = dataset_index_year_timeseries(
+            Fi=Fi,
+            citations=citations,
+            mentions=mentions,
+            pubyear=pubyear,
+            FT=FT,
+            CTw=CTw,
+            MTw=MTw,
+        )
 
     if dataset_index_series:
         dataset_report["dataset_index_series"] = dataset_index_series
@@ -228,21 +253,21 @@ def dataset_index_series_from_url(
       - find_citations_oa
       - find_citations_dc_from_citation_block
     """
-    print("[status] Validating URL...")
-    if not isinstance(url, str) or not url.strip():
-        raise ValueError("url must be a non-empty string")
-    url = url.strip()
+    with timed_block("Validating URL"):
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError("url must be a non-empty string")
+        url = url.strip()
 
-    if not url.startswith(("http://", "https://")):
-        raise ValueError(
-            f"Invalid URL format: {url} (must start with http:// or https://)"
-        )
-    if not is_url(url):
-        raise ValueError(f"Invalid URL format: {url}")
+        if not url.startswith(("http://", "https://")):
+            raise ValueError(
+                f"Invalid URL format: {url} (must start with http:// or https://)"
+            )
+        if not is_url(url):
+            raise ValueError(f"Invalid URL format: {url}")
 
-    print("[status] Checking URL reachability...")
-    if not _is_reachable(url):
-        raise ValueError(f"'{url}' does not appear to be reachable.")
+    with timed_block("Checking URL reachability"):
+        if not _is_reachable(url):
+            raise ValueError(f"'{url}' does not appear to be reachable.")
 
     norm_url = _norm_dataset_id(url)
     norm_identifier = _norm_dataset_id(identifier)
@@ -274,26 +299,41 @@ def dataset_index_series_from_url(
     norm_path = default_norm_db_path()
 
     def _task_fair():
-        return ("fair", fair_evaluation_report(url))
+        return ("fair", timed_call("FAIR score", fair_evaluation_report, url))
 
     def _task_citations_mdc():
         return (
             "citations_mdc",
-            find_citations_mdc_duckdb(url, dataset_pubyear=pubyear, db_path=mdc_path),
+            timed_call(
+                "citations (MDC)",
+                find_citations_mdc_duckdb,
+                url,
+                dataset_pubyear=pubyear,
+                db_path=mdc_path,
+            ),
         )
 
     def _task_mentions_github():
         return (
             "mentions_github",
-            find_github_mentions_for_dataset_id(url, dataset_pubyear=pubyear),
+            timed_call(
+                "mentions (GitHub)",
+                find_github_mentions_for_dataset_id,
+                url,
+                dataset_pubyear=pubyear,
+            ),
         )
 
     def _task_norm():
         try:
             return (
                 "norm",
-                get_subfield_year_norm_factors(
-                    norm_path, subfield_id=subfield_id, pubyear=pubyear
+                timed_call(
+                    "normalization factors",
+                    get_subfield_year_norm_factors,
+                    norm_path,
+                    subfield_id=subfield_id,
+                    pubyear=pubyear,
                 ),
             )
         except KeyError:
@@ -331,32 +371,32 @@ def dataset_index_series_from_url(
         except Exception:
             fair_score = None
 
-    print("[status] Merging citations...")
-    citations = merge_citations_dicts(citations_list) if citations_list else None
+    with timed_block("Merging citations"):
+        citations = merge_citations_dicts(citations_list) if citations_list else None
     dataset_report["citations"] = citations
 
-    print("[status] Merging mentions...")
-    mentions_list_url: list[list[dict]] = [mentions_github] if mentions_github else []
-    mentions = merge_mentions_dicts(mentions_list_url) if mentions_list_url else None
+    with timed_block("Merging mentions"):
+        mentions_list_url: list[list[dict]] = [mentions_github] if mentions_github else []
+        mentions = merge_mentions_dicts(mentions_list_url) if mentions_list_url else None
     dataset_report["mentions"] = mentions
 
     dataset_report["normalization_factors"] = norm
 
-    print("[status] Computing dataset index time series...")
-    Fi = fair_score if fair_score is not None else 0.0
-    FT = norm["FT"] if norm else 13.46
-    CTw = norm["CTw"] if norm else 1.0
-    MTw = norm["MTw"] if norm else 1.0
+    with timed_block("Computing dataset index time series"):
+        Fi = fair_score if fair_score is not None else 0.0
+        FT = norm["FT"] if norm else 13.46
+        CTw = norm["CTw"] if norm else 1.0
+        MTw = norm["MTw"] if norm else 1.0
 
-    dataset_index_series = dataset_index_year_timeseries(
-        Fi=Fi,
-        citations=citations,
-        mentions=mentions,
-        pubyear=pubyear,
-        FT=FT,
-        CTw=CTw,
-        MTw=MTw,
-    )
+        dataset_index_series = dataset_index_year_timeseries(
+            Fi=Fi,
+            citations=citations,
+            mentions=mentions,
+            pubyear=pubyear,
+            FT=FT,
+            CTw=CTw,
+            MTw=MTw,
+        )
 
     dataset_report["dataset_index_series"] = dataset_index_series or None
     print("[status] dataset_index_series_from_url done.")
