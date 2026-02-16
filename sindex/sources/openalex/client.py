@@ -53,7 +53,7 @@ def get_openalex_record(
     GET OpenAlex API endpoint and return the JSON response.
 
     This function makes a GET request to the OpenAlex API and returns the
-    parsed JSON response. It handles 404 errors gracefully by returning None.
+    parsed JSON response. It returns None for 404 (not found) or 429 (rate limit).
 
     Args:
         path: API endpoint path (e.g., "/works/W1234567890").
@@ -62,21 +62,24 @@ def get_openalex_record(
         timeout: Request timeout in seconds.
 
     Returns:
-        Parsed JSON response as a dictionary, or None if the resource is not found (404).
+        Parsed JSON response as a dictionary, or None if not found (404) or rate limited (429).
 
     Raises:
-        requests.HTTPError: If the API returns an HTTP error other than 404.
+        requests.HTTPError: If the API returns an HTTP error other than 404 or 429.
         RuntimeError: If the response is not valid JSON.
 
     Notes:
         - Does NOT call raise_for_status() automatically, but will raise for
-          non-404 errors after attempting to parse JSON.
+          errors other than 404/429 after attempting to parse JSON.
     """
     url = f"{OA_BASE_URL}{path}"
     print(f"[status] get_openalex_record: GET {path} (timeout={timeout}s)...")
     r = session.get(url, params=params, timeout=timeout)
     if r.status_code == 404:
         print(f"[status] get_openalex_record: 404 for {path}")
+        return None
+    if r.status_code == 429:
+        print(f"[status] get_openalex_record: rate limited (429) for {path}")
         return None
 
     try:
