@@ -77,7 +77,9 @@ def dataset_index_series_from_doi(doi):
     with timed_block("Getting OpenAlex primary topic"):
         print(f"[status] get_primary_topic_for_doi: starting for norm_doi={norm_doi!r}")
         topic_result = get_primary_topic_for_doi(norm_doi)
-        print(f"[status] get_primary_topic_for_doi: finished (result={'ok' if topic_result else 'None'})")
+        print(
+            f"[status] get_primary_topic_for_doi: finished (result={'ok' if topic_result else 'None'})"
+        )
 
     subfield_id = None
     dataset_report["topic"] = None
@@ -116,7 +118,9 @@ def dataset_index_series_from_doi(doi):
     def _task_citations_oa():
         return (
             "citations_oa",
-            timed_call("citations (OpenAlex)", find_citations_oa, doi, dataset_pubyear=pubyear),
+            timed_call(
+                "citations (OpenAlex)", find_citations_oa, doi, dataset_pubyear=pubyear
+            ),
         )
 
     def _task_citations_dc():
@@ -376,8 +380,12 @@ def dataset_index_series_from_url(
     dataset_report["citations"] = citations
 
     with timed_block("Merging mentions"):
-        mentions_list_url: list[list[dict]] = [mentions_github] if mentions_github else []
-        mentions = merge_mentions_dicts(mentions_list_url) if mentions_list_url else None
+        mentions_list_url: list[list[dict]] = (
+            [mentions_github] if mentions_github else []
+        )
+        mentions = (
+            merge_mentions_dicts(mentions_list_url) if mentions_list_url else None
+        )
     dataset_report["mentions"] = mentions
 
     dataset_report["normalization_factors"] = norm
